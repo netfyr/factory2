@@ -15,6 +15,7 @@ class Config:
     fast_model: str = "claude-haiku-4-5"  # analyze-deps, summarize, commit
     max_turns: int = 100
     verify_turns: int = 120
+    stall_timeout: int = 600
     verbose: bool = False
     cmd: str = "claude"        # CLI binary name/path
     skip_permissions: bool = True

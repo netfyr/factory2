@@ -129,7 +129,7 @@ def run_llm_dependency_analysis(config: Config, story_ids: list[str], state: Sta
     config.output_dir.mkdir(parents=True, exist_ok=True)
     log_file = config.output_dir / "deps_analysis.log"
 
-    success, usage = run_agent(
+    success, usage, _stalled = run_agent(
         prompt=prompt,
         log_file=log_file,
         model=config.fast_model,
@@ -138,6 +138,7 @@ def run_llm_dependency_analysis(config: Config, story_ids: list[str], state: Sta
         cmd=config.cmd,
         skip_permissions=config.skip_permissions,
         verbose=config.verbose,
+        stall_timeout=config.stall_timeout,
     )
 
     if not success:

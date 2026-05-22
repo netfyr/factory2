@@ -72,6 +72,9 @@ def _phase_done(state: State, story_id: str, phase: str, output_file: Path | Non
     return True
 
 
+_MAX_STALL_RETRIES = 2
+
+
 def _run_phase(
     config: Config,
     state: State,
@@ -84,53 +87,66 @@ def _run_phase(
     output_file: Path | None = None,
     post_check: callable = None,
 ) -> bool:
-    """Generic phase runner. Returns True on success."""
-    state.set_phase_status(story_id, phase, "running")
-    log.info(f"[{story_id}] {phase}: starting")
+    """Generic phase runner with stall retry. Returns True on success."""
 
-    activity_file = config.stories_dir / story_id / "activity"
-    success, usage = run_agent(
-        prompt=prompt,
-        log_file=log_file,
-        model=model,
-        max_turns=max_turns,
-        workdir=config.project_dir,
+    for stall_attempt in range(_MAX_STALL_RETRIES + 1):
+        state.set_phase_status(story_id, phase, "running")
+        log.info(f"[{story_id}] {phase}: starting")
 
-        cmd=config.cmd,
-        skip_permissions=config.skip_permissions,
-        verbose=config.verbose,
-        activity_file=activity_file,
-    )
-
-    # Track costs
-    if usage.input_tokens or usage.output_tokens or usage.cache_creation_tokens or usage.cache_read_tokens:
-        state.add_cost(
-            story_id, phase, usage.input_tokens, usage.output_tokens,
-            cache_creation_tokens=usage.cache_creation_tokens,
-            cache_read_tokens=usage.cache_read_tokens,
-            num_turns=usage.num_turns,
+        activity_file = config.stories_dir / story_id / "activity"
+        success, usage, stalled = run_agent(
+            prompt=prompt,
+            log_file=log_file,
             model=model,
+            max_turns=max_turns,
+            workdir=config.project_dir,
+
+            cmd=config.cmd,
+            skip_permissions=config.skip_permissions,
+            verbose=config.verbose,
+            activity_file=activity_file,
+            stall_timeout=config.stall_timeout,
         )
 
-    if not success:
-        state.set_phase_status(story_id, phase, "failed")
-        return False
+        # Track costs
+        if usage.input_tokens or usage.output_tokens or usage.cache_creation_tokens or usage.cache_read_tokens:
+            state.add_cost(
+                story_id, phase, usage.input_tokens, usage.output_tokens,
+                cache_creation_tokens=usage.cache_creation_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                num_turns=usage.num_turns,
+                model=model,
+            )
 
-    # Check output file was created
-    if output_file and not output_file.exists():
-        log.error(f"[{story_id}] {phase}: agent ran but did not produce {output_file}")
-        state.set_phase_status(story_id, phase, "failed")
-        return False
+        if stalled and stall_attempt < _MAX_STALL_RETRIES:
+            log.warn(
+                f"[{story_id}] {phase}: stalled, retrying "
+                f"({stall_attempt + 1}/{_MAX_STALL_RETRIES})"
+            )
+            continue
 
-    # Run optional post-check (e.g., cargo check)
-    if post_check and not post_check():
-        log.warn(f"[{story_id}] {phase}: post-check failed")
-        state.set_phase_status(story_id, phase, "failed")
-        return False
+        if not success:
+            state.set_phase_status(story_id, phase, "failed")
+            return False
 
-    state.set_phase_status(story_id, phase, "done")
-    log.info(f"[{story_id}] {phase}: complete")
-    return True
+        # Check output file was created
+        if output_file and not output_file.exists():
+            log.error(f"[{story_id}] {phase}: agent ran but did not produce {output_file}")
+            state.set_phase_status(story_id, phase, "failed")
+            return False
+
+        # Run optional post-check (e.g., cargo check)
+        if post_check and not post_check():
+            log.warn(f"[{story_id}] {phase}: post-check failed")
+            state.set_phase_status(story_id, phase, "failed")
+            return False
+
+        state.set_phase_status(story_id, phase, "done")
+        log.info(f"[{story_id}] {phase}: complete")
+        return True
+
+    state.set_phase_status(story_id, phase, "failed")
+    return False
 
 
 # ── Phase implementations ────────────────────────────────────────
@@ -380,7 +396,7 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
         f"Write to: {commit_msg_file}\n"
     )
 
-    success, usage = run_agent(
+    success, usage, _stalled = run_agent(
         prompt=prompt,
         log_file=log_dir / "commit.log",
         model=config.default_model,
@@ -390,6 +406,7 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
         cmd=config.cmd,
         skip_permissions=config.skip_permissions,
         verbose=config.verbose,
+        stall_timeout=config.stall_timeout,
     )
 
     if usage.input_tokens or usage.output_tokens or usage.cache_creation_tokens or usage.cache_read_tokens:

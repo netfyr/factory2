@@ -1,4 +1,5 @@
 import json
+import select
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -26,8 +27,9 @@ def run_agent(
     skip_permissions: bool = True,
     verbose: bool = False,
     activity_file: Path | None = None,
-) -> tuple[bool, Usage]:
-    """Run a coding agent CLI in print mode. Returns (success, usage)."""
+    stall_timeout: int = 0,
+) -> tuple[bool, Usage, bool]:
+    """Run a coding agent CLI in print mode. Returns (success, usage, stalled)."""
 
     cmd_list = _build_claude_cmd(cmd, model, max_turns, skip_permissions)
 
@@ -38,6 +40,7 @@ def run_agent(
 
     usage = Usage()
     result_seen = False
+    stalled = False
 
     with open(log_file, "w") as lf:
         proc = subprocess.Popen(
@@ -51,7 +54,20 @@ def run_agent(
         proc.stdin.write(prompt)
         proc.stdin.close()
 
-        for line in proc.stdout:
+        timeout_val = stall_timeout if stall_timeout > 0 else None
+
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], timeout_val)
+            if not ready:
+                log.error(f"  Agent stalled — no output for {stall_timeout}s, killing")
+                stalled = True
+                proc.kill()
+                proc.wait()
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+
             lf.write(line)
             lf.flush()
 
@@ -77,16 +93,18 @@ def run_agent(
                 except json.JSONDecodeError:
                     pass
 
-    _wait_or_terminate(proc, result_seen)
+    if not stalled:
+        _wait_or_terminate(proc, result_seen)
 
     if activity_file:
         activity_file.unlink(missing_ok=True)
         (activity_file.parent / "live_usage").unlink(missing_ok=True)
 
-    if proc.returncode != 0:
+    if not stalled and proc.returncode != 0:
         log.error(f"  Agent exited with code {proc.returncode}")
 
-    return proc.returncode == 0, usage
+    success = not stalled and proc.returncode == 0
+    return success, usage, stalled
 
 
 _AGENT_EXIT_GRACE = 30

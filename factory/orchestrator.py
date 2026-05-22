@@ -378,7 +378,7 @@ def _generate_summary(config: Config, story_ids: list[str], state: State):
     )
 
     log_file = config.output_dir / "summary.log"
-    success, usage = run_agent(
+    success, usage, _stalled = run_agent(
         prompt=prompt,
         log_file=log_file,
         model=config.fast_model,
@@ -387,6 +387,7 @@ def _generate_summary(config: Config, story_ids: list[str], state: State):
         cmd=config.cmd,
         skip_permissions=config.skip_permissions,
         verbose=config.verbose,
+        stall_timeout=config.stall_timeout,
     )
 
     summary_file = config.output_dir / "summary.md"
