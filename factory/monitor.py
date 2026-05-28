@@ -177,29 +177,54 @@ def show_status(state_dir: Path):
 
     sorted_sids = sorted(stories.keys())
 
-    # Separate non-done (always shown) from done (collapsible)
-    non_done_sids = [sid for sid in sorted_sids if stories[sid].get("status", "pending") != "done"]
-    done_sids = [sid for sid in sorted_sids if stories[sid].get("status", "pending") == "done"]
+    # Separate active (always shown) from inactive (collapsible)
+    _collapsible = {"done", "skipped"}
+    active_sids = [sid for sid in sorted_sids if stories[sid].get("status", "pending") not in _collapsible]
+    inactive_sids = [sid for sid in sorted_sids if stories[sid].get("status", "pending") in _collapsible]
 
-    # Each non-done story may need 2 lines (activity/reason), budget accordingly
-    non_done_lines = len(non_done_sids) * 2
-    remaining = max(max_story_rows - non_done_lines, 0)
+    # Each active story may need 2 lines (activity/reason), budget accordingly
+    active_lines = len(active_sids) * 2
+    remaining = max(max_story_rows - active_lines, 0)
 
-    if len(done_sids) + len(non_done_sids) * 2 <= max_story_rows:
+    def _story_lines(sid):
+        """Actual display lines: 2 for skipped-with-reason, 1 otherwise."""
+        s = stories[sid]
+        if s.get("status") == "skipped" and s.get("skip_reason"):
+            return 2
+        return 1
+
+    inactive_lines = sum(_story_lines(sid) for sid in inactive_sids)
+    if inactive_lines + active_lines <= max_story_rows:
         # Everything fits — show all
         visible_sids = sorted_sids
-        collapsed_count = 0
+        collapsed_sids = []
     else:
-        # Collapse oldest done stories, keep most recent done visible
-        visible_done = done_sids[-remaining:] if remaining > 0 else []
-        collapsed_count = len(done_sids) - len(visible_done)
-        visible_sids = visible_done + non_done_sids
+        # Collapse oldest inactive stories, keep most recent visible
+        # Allocate from the end, counting actual lines per story
+        visible_inactive = []
+        lines_used = 0
+        for sid in reversed(inactive_sids):
+            needed = _story_lines(sid)
+            if lines_used + needed > remaining:
+                break
+            visible_inactive.append(sid)
+            lines_used += needed
+        visible_inactive.reverse()
+        collapsed_sids = inactive_sids[:len(inactive_sids) - len(visible_inactive)]
+        visible_sids = visible_inactive + active_sids
         # Re-sort to maintain order
         order = {sid: i for i, sid in enumerate(sorted_sids)}
         visible_sids.sort(key=lambda sid: order[sid])
 
-    if collapsed_count > 0:
-        print(f"  {DIM}... {collapsed_count} completed stories hidden ...{NC}")
+    if collapsed_sids:
+        n_done = sum(1 for sid in collapsed_sids if stories[sid].get("status") == "done")
+        n_skipped = sum(1 for sid in collapsed_sids if stories[sid].get("status") == "skipped")
+        parts = []
+        if n_done:
+            parts.append(f"{n_done} completed")
+        if n_skipped:
+            parts.append(f"{n_skipped} skipped")
+        print(f"  {DIM}... {', '.join(parts)} stories hidden ...{NC}")
 
     for sid in visible_sids:
         s = stories[sid]
