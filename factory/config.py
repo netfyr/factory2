@@ -11,10 +11,11 @@ class Config:
     max_parallel: int = 1
     max_retries: int = 3
     strong_model: str = "claude-opus-4-6"     # plan
-    default_model: str = "claude-sonnet-4-6"  # understand, implement, write-tests, verify
+    default_model: str = "claude-sonnet-4-6"  # understand, implement, review, write-tests, verify
     fast_model: str = "claude-haiku-4-5"  # analyze-deps, summarize, commit
     max_turns: int = 100
     verify_turns: int = 120
+    max_review_iterations: int = 2
     stall_timeout: int = 600
     verbose: bool = False
     cmd: str = "claude"        # CLI binary name/path

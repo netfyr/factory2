@@ -42,6 +42,7 @@ def run_story_pipeline(config: Config, story_id: str, spec_file: Path, state: St
         ("understand", _run_understand),
         ("plan", _run_plan),
         ("implement", _run_implement),
+        ("review", _run_review),
         ("write_tests", _run_write_tests),
         ("verify", _run_verify),
     ]
@@ -233,6 +234,129 @@ def _run_implement(config, story_id, spec_file, story_dir, log_dir, state):
         log_dir / "implement.log", config.default_model, config.max_turns,
         post_check=cargo_check,
     )
+
+
+def _parse_review_verdict(review_file: Path) -> str:
+    """Parse the verdict from a review.md file. Returns 'PASS' or 'NEEDS_REVISION'."""
+    try:
+        content = review_file.read_text()
+    except OSError:
+        return "NEEDS_REVISION"
+
+    in_verdict = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## Verdict"):
+            in_verdict = True
+            continue
+        if in_verdict and stripped:
+            upper = stripped.upper()
+            if "NEEDS_REVISION" in upper:
+                return "NEEDS_REVISION"
+            if upper == "PASS":
+                return "PASS"
+            break
+    return "PASS"
+
+
+def _run_implement_with_review(config, story_id, spec_file, story_dir, log_dir, state, review_file):
+    """Re-run implement with review feedback appended to the prompt."""
+    plan_file = story_dir / "plan.md"
+    template = (config.prompts_dir / "implement.md").read_text()
+    context = generate_context(config)
+    prompt = (
+        f"{template}\n\n"
+        f"## Your Task\n\n"
+        f"- Story ID: {story_id}\n"
+        f"- The project code is in: {config.project_dir}/\n"
+        f"- Work inside the project directory. Create or modify files as needed.\n\n"
+        f"{context}"
+        f"## Specification\n\n{spec_file.read_text()}\n\n"
+        f"## Implementation Plan\n\n{plan_file.read_text()}\n\n"
+        f"## Review Feedback\n\n"
+        f"A code review found issues with the current implementation. "
+        f"Fix the issues described below while preserving all working code.\n\n"
+        f"{review_file.read_text()}"
+    )
+
+    def cargo_check():
+        result = cargo.check(config.project_dir)
+        if not result.success:
+            log.warn(f"[{story_id}] implement (revision): cargo check failed — {result.summary()}")
+            if result.format_errors():
+                log.warn(result.format_errors())
+        return result.success
+
+    return _run_phase(
+        config, state, story_id, "implement", prompt,
+        log_dir / "implement_revision.log", config.default_model, config.max_turns,
+        post_check=cargo_check,
+    )
+
+
+def _run_review(config, story_id, spec_file, story_dir, log_dir, state):
+    review_file = story_dir / "review.md"
+    plan_file = story_dir / "plan.md"
+
+    if _phase_done(state, story_id, "review", review_file):
+        return True
+
+    template = (config.prompts_dir / "review.md").read_text()
+    max_iterations = config.max_review_iterations
+
+    for iteration in range(1, max_iterations + 1):
+        review_file.unlink(missing_ok=True)
+
+        context = generate_context(config)
+        prompt = (
+            f"{template}\n\n"
+            f"## Your Task\n\n"
+            f"- Story ID: {story_id}\n"
+            f"- Write your review to: {review_file}\n"
+            f"- The project code is in: {config.project_dir}/\n\n"
+            f"{context}"
+            f"## Specification\n\n{spec_file.read_text()}\n\n"
+            f"## Implementation Plan\n\n{plan_file.read_text()}"
+        )
+
+        if iteration > 1:
+            log.phase(f"[{story_id}] review: iteration {iteration}/{max_iterations}")
+
+        log_name = "review.log" if iteration == 1 else f"review.{iteration - 1}.log"
+        ok = _run_phase(
+            config, state, story_id, "review", prompt,
+            log_dir / log_name, config.default_model, config.max_turns,
+            output_file=review_file,
+        )
+
+        if not ok:
+            return False
+
+        verdict = _parse_review_verdict(review_file)
+
+        if verdict == "PASS":
+            return True
+
+        # NEEDS_REVISION: re-run implement with review feedback
+        if iteration < max_iterations:
+            log.warn(
+                f"[{story_id}] review: NEEDS_REVISION "
+                f"(iteration {iteration}/{max_iterations}), re-implementing"
+            )
+            state.set_phase_status(story_id, "implement", "pending")
+            if not _run_implement_with_review(
+                config, story_id, spec_file, story_dir, log_dir, state, review_file
+            ):
+                return False
+            state.set_phase_status(story_id, "review", "pending")
+        else:
+            log.warn(
+                f"[{story_id}] review: NEEDS_REVISION after "
+                f"{max_iterations} iterations, proceeding anyway"
+            )
+            return True
+
+    return True
 
 
 def _run_write_tests(config, story_id, spec_file, story_dir, log_dir, state):

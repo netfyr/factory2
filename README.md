@@ -10,6 +10,7 @@ specs/*.md ──► dependency analysis ──► per-story pipeline ──► 
                                             ├─ understand (gap analysis)
                                             ├─ plan (implementation design)
                                             ├─ implement (write code)
+                                            ├─ review (spec adherence + correctness)
                                             ├─ write-tests (from acceptance criteria)
                                             ├─ verify (run tests, fix, repeat)
                                             └─ commit (git commit with summary)
@@ -17,16 +18,19 @@ specs/*.md ──► dependency analysis ──► per-story pipeline ──► 
 
 1. **Dependency analysis** — the factory parses `## Depends on` sections from each spec file to build a dependency graph (`deps.json`), determining which stories must be implemented first. This is deterministic and instant — no LLM call required.
 
-2. **Per-story pipeline** — each story passes through five phases, each a separate Claude Code invocation:
+2. **Per-story pipeline** — each story passes through six phases, each a separate Claude Code invocation:
 
    | Phase | Input | Output | Purpose |
    |-------|-------|--------|---------|
    | understand | spec + codebase | `understand.md` | Gap analysis: what exists, what's missing |
    | plan | spec + understand.md | `plan.md` | Concrete implementation plan with file paths and signatures |
    | implement | spec + plan.md | Rust code | Write the code, ensure it compiles |
+   | review | spec + plan + code | `review.md` | Check spec adherence, correctness, edge cases |
    | write-tests | spec + code | Test code | Tests derived from acceptance criteria |
    | verify | spec + code + tests | `results.md` | Run tests, fix failures, report results |
    | commit | results.md | git commit | Commit with message explaining what and why |
+
+   The review phase produces a verdict (PASS or NEEDS_REVISION). On NEEDS_REVISION, the implement phase re-runs with the review feedback, then review runs again — up to `--review-iterations` times (default 2). After exhausting iterations, the pipeline proceeds to write-tests regardless. This catches design-level issues before the more expensive test-fix-retry loop in verify.
 
 3. **Summary** — after all stories are processed, a final LLM run produces a combined summary of what was built.
 
@@ -264,6 +268,7 @@ usage: factory [-h] --specs DIR [--state-dir DIR]
       --state-dir DIR      Factory state directory (default: <project-dir>/.factory)
   -j, --parallel N         Max parallel story pipelines (default: 1)
   -r, --retries N          Max verify fix attempts per story (default: 3)
+      --review-iterations N Max review-implement iterations per story (default: 2)
       --strong-model MODEL Model for plan phase (default: claude-opus-4-6)
       --default-model MODEL Model for understand, implement, write-tests, verify (default: claude-sonnet-4-6)
       --fast-model MODEL   Model for dep analysis, summary, commit messages (default: claude-haiku-4-5)

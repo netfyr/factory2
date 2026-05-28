@@ -156,7 +156,7 @@ def show_status(state_dir: Path):
 
     # Per-story table
     stories_dir = state_dir / "stories"
-    phases = ["understand", "plan", "implement", "write_tests", "verify"]
+    phases = ["understand", "plan", "implement", "review", "write_tests", "verify"]
 
     # Dynamic column width based on longest story ID, capped at 40
     name_width = min(max((len(sid) for sid in stories), default=20) + 2, 40)

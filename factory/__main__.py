@@ -53,6 +53,10 @@ def main():
         help="Max turns for verify phase (default: 120)",
     )
     parser.add_argument(
+        "--review-iterations", type=int, default=2,
+        help="Max review-implement iterations per story (default: 2)",
+    )
+    parser.add_argument(
         "--stall-timeout", type=int, default=600,
         help="Kill agent after N seconds without output (default: 600, 0=disabled)",
     )
@@ -91,6 +95,7 @@ def main():
         state_dir=state_dir,
         max_parallel=args.parallel,
         max_retries=args.retries,
+        max_review_iterations=args.review_iterations,
         strong_model=args.strong_model or Config.strong_model,
         default_model=args.default_model or Config.default_model,
         fast_model=args.fast_model or Config.fast_model,
