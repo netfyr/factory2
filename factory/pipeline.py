@@ -505,6 +505,7 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
     spec_title = spec_file.read_text().split("\n")[0].lstrip("# ").strip()
 
     commit_msg_file = story_dir / "commit_msg.txt"
+    commit_msg_file.unlink(missing_ok=True)
     prompt = (
         "Write a git commit message to the file specified below. "
         "Output ONLY the commit message file, nothing else.\n\n"
