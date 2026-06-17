@@ -8,6 +8,7 @@ class Config:
     specs_dir: Path
     state_dir: Path
     factory_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+    profile_name: str = ""     # empty = auto-detect from project files
     max_parallel: int = 1
     max_retries: int = 3
     strong_model: str = "claude-opus-4-6"     # plan
@@ -40,6 +41,10 @@ class Config:
     @property
     def state_file(self) -> Path:
         return self.state_dir / "state.json"
+
+    @property
+    def profiles_dir(self) -> Path:
+        return self.factory_dir / "profiles"
 
     @property
     def deps_file(self) -> Path:

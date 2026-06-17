@@ -40,6 +40,13 @@ class State:
     def _ensure_story(self, data: dict, story_id: str) -> dict:
         return data.setdefault("stories", {}).setdefault(story_id, {})
 
+    # ── Top-level metadata ────────────────────────────────────────
+
+    def set_metadata(self, key: str, value):
+        def update(data):
+            data[key] = value
+        self._update(update)
+
     # ── Story status ─────────────────────────────────────────────
 
     def get_story_status(self, story_id: str) -> str:

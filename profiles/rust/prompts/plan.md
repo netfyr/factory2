@@ -31,7 +31,7 @@ For each file that needs to be created or modified:
 - **Why**: how this file addresses the requirements
 
 ### Dependencies
-Any new external dependencies needed in the project manifest (with version). Justify each one — explain why the standard library is insufficient. Minimize external dependencies: prefer the standard library whenever feasible, even if it means slightly more code.
+Any new crate dependencies needed in Cargo.toml (with version). Justify each one — explain why the Rust standard library is insufficient. Minimize external crates: prefer std over third-party crates whenever feasible, even if it means slightly more code.
 
 ### Implementation Order
 Number the steps. Each step should result in a compilable state. Explain dependencies between steps (e.g., "step 3 requires the types from step 2").

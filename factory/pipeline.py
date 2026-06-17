@@ -2,9 +2,9 @@ import re
 import subprocess
 from pathlib import Path
 
-from . import cargo, log
+from . import log
 from .config import Config
-from .context import generate_context
+from .profile import Profile
 from .runner import run_agent
 from .state import State
 
@@ -30,7 +30,9 @@ def _co_author_trailer(model: str) -> str:
     return f"Co-Authored-By: {display} <noreply@anthropic.com>"
 
 
-def run_story_pipeline(config: Config, story_id: str, spec_file: Path, state: State) -> bool:
+def run_story_pipeline(
+    config: Config, story_id: str, spec_file: Path, state: State, profile: Profile,
+) -> bool:
     """Run all phases for a story. Returns True on success."""
     story_dir = config.stories_dir / story_id
     log_dir = story_dir / "log"
@@ -48,12 +50,12 @@ def run_story_pipeline(config: Config, story_id: str, spec_file: Path, state: St
     ]
 
     for phase_name, phase_fn in phases:
-        if not phase_fn(config, story_id, spec_file, story_dir, log_dir, state):
+        if not phase_fn(config, story_id, spec_file, story_dir, log_dir, state, profile):
             log.error(f"[{story_id}] Phase '{phase_name}' failed")
             return False
 
     # Commit (non-fatal)
-    if not _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
+    if not _run_commit(config, story_id, spec_file, story_dir, log_dir, state, profile):
         log.warn(f"[{story_id}] Commit failed (non-fatal)")
 
     log.info(f"[{story_id}] Pipeline complete")
@@ -153,13 +155,13 @@ def _run_phase(
 # ── Phase implementations ────────────────────────────────────────
 
 
-def _run_understand(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_understand(config, story_id, spec_file, story_dir, log_dir, state, profile):
     output_file = story_dir / "understand.md"
     if _phase_done(state, story_id, "understand", output_file):
         return True
 
-    template = (config.prompts_dir / "understand.md").read_text()
-    context = generate_context(config)
+    template = profile.get_prompt_path("understand").read_text()
+    context = profile.generate_context(config)
     prompt = (
         f"{template}\n\n"
         f"## Your Task\n\n"
@@ -172,19 +174,21 @@ def _run_understand(config, story_id, spec_file, story_dir, log_dir, state):
 
     return _run_phase(
         config, state, story_id, "understand", prompt,
-        log_dir / "understand.log", config.default_model, config.max_turns,
+        log_dir / "understand.log",
+        profile.get_model("understand", config),
+        profile.get_max_turns("understand", config),
         output_file=output_file,
     )
 
 
-def _run_plan(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_plan(config, story_id, spec_file, story_dir, log_dir, state, profile):
     output_file = story_dir / "plan.md"
     understand_file = story_dir / "understand.md"
     if _phase_done(state, story_id, "plan", output_file):
         return True
 
-    template = (config.prompts_dir / "plan.md").read_text()
-    context = generate_context(config)
+    template = profile.get_prompt_path("plan").read_text()
+    context = profile.generate_context(config)
     prompt = (
         f"{template}\n\n"
         f"## Your Task\n\n"
@@ -198,18 +202,20 @@ def _run_plan(config, story_id, spec_file, story_dir, log_dir, state):
 
     return _run_phase(
         config, state, story_id, "plan", prompt,
-        log_dir / "plan.log", config.strong_model, config.max_turns,
+        log_dir / "plan.log",
+        profile.get_model("plan", config),
+        profile.get_max_turns("plan", config),
         output_file=output_file,
     )
 
 
-def _run_implement(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_implement(config, story_id, spec_file, story_dir, log_dir, state, profile):
     if _phase_done(state, story_id, "implement"):
         return True
 
     plan_file = story_dir / "plan.md"
-    template = (config.prompts_dir / "implement.md").read_text()
-    context = generate_context(config)
+    template = profile.get_prompt_path("implement").read_text()
+    context = profile.generate_context(config)
     prompt = (
         f"{template}\n\n"
         f"## Your Task\n\n"
@@ -221,18 +227,22 @@ def _run_implement(config, story_id, spec_file, story_dir, log_dir, state):
         f"## Implementation Plan\n\n{plan_file.read_text()}"
     )
 
-    def cargo_check():
-        result = cargo.check(config.project_dir)
-        if not result.success:
-            log.warn(f"[{story_id}] implement: cargo check failed — {result.summary()}")
-            if result.format_errors():
-                log.warn(result.format_errors())
-        return result.success
+    def post_check():
+        for tool_name in profile.get_phase("implement").post_checks:
+            result = profile.run_tool(tool_name, config.project_dir)
+            if not result.success:
+                log.warn(f"[{story_id}] implement: {tool_name} failed — {result.summary}")
+                if result.details:
+                    log.warn(result.details)
+                return False
+        return True
 
     return _run_phase(
         config, state, story_id, "implement", prompt,
-        log_dir / "implement.log", config.default_model, config.max_turns,
-        post_check=cargo_check,
+        log_dir / "implement.log",
+        profile.get_model("implement", config),
+        profile.get_max_turns("implement", config),
+        post_check=post_check,
     )
 
 
@@ -259,11 +269,11 @@ def _parse_review_verdict(review_file: Path) -> str:
     return "PASS"
 
 
-def _run_implement_with_review(config, story_id, spec_file, story_dir, log_dir, state, review_file):
+def _run_implement_with_review(config, story_id, spec_file, story_dir, log_dir, state, review_file, profile):
     """Re-run implement with review feedback appended to the prompt."""
     plan_file = story_dir / "plan.md"
-    template = (config.prompts_dir / "implement.md").read_text()
-    context = generate_context(config)
+    template = profile.get_prompt_path("implement").read_text()
+    context = profile.generate_context(config)
     prompt = (
         f"{template}\n\n"
         f"## Your Task\n\n"
@@ -279,35 +289,40 @@ def _run_implement_with_review(config, story_id, spec_file, story_dir, log_dir, 
         f"{review_file.read_text()}"
     )
 
-    def cargo_check():
-        result = cargo.check(config.project_dir)
-        if not result.success:
-            log.warn(f"[{story_id}] implement (revision): cargo check failed — {result.summary()}")
-            if result.format_errors():
-                log.warn(result.format_errors())
-        return result.success
+    def post_check():
+        for tool_name in profile.get_phase("implement").post_checks:
+            result = profile.run_tool(tool_name, config.project_dir)
+            if not result.success:
+                log.warn(f"[{story_id}] implement (revision): {tool_name} failed — {result.summary}")
+                if result.details:
+                    log.warn(result.details)
+                return False
+        return True
 
     return _run_phase(
         config, state, story_id, "implement", prompt,
-        log_dir / "implement_revision.log", config.default_model, config.max_turns,
-        post_check=cargo_check,
+        log_dir / "implement_revision.log",
+        profile.get_model("implement", config),
+        profile.get_max_turns("implement", config),
+        post_check=post_check,
     )
 
 
-def _run_review(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_review(config, story_id, spec_file, story_dir, log_dir, state, profile):
     review_file = story_dir / "review.md"
     plan_file = story_dir / "plan.md"
 
     if _phase_done(state, story_id, "review", review_file):
         return True
 
-    template = (config.prompts_dir / "review.md").read_text()
-    max_iterations = config.max_review_iterations
+    template = profile.get_prompt_path("review").read_text()
+    phase_def = profile.get_phase("review")
+    max_iterations = phase_def.max_iterations or config.max_review_iterations
 
     for iteration in range(1, max_iterations + 1):
         review_file.unlink(missing_ok=True)
 
-        context = generate_context(config)
+        context = profile.generate_context(config)
         prompt = (
             f"{template}\n\n"
             f"## Your Task\n\n"
@@ -325,7 +340,9 @@ def _run_review(config, story_id, spec_file, story_dir, log_dir, state):
         log_name = "review.log" if iteration == 1 else f"review.{iteration - 1}.log"
         ok = _run_phase(
             config, state, story_id, "review", prompt,
-            log_dir / log_name, config.default_model, config.max_turns,
+            log_dir / log_name,
+            profile.get_model("review", config),
+            profile.get_max_turns("review", config),
             output_file=review_file,
         )
 
@@ -345,7 +362,7 @@ def _run_review(config, story_id, spec_file, story_dir, log_dir, state):
             )
             state.set_phase_status(story_id, "implement", "pending")
             if not _run_implement_with_review(
-                config, story_id, spec_file, story_dir, log_dir, state, review_file
+                config, story_id, spec_file, story_dir, log_dir, state, review_file, profile
             ):
                 return False
             state.set_phase_status(story_id, "review", "pending")
@@ -359,12 +376,12 @@ def _run_review(config, story_id, spec_file, story_dir, log_dir, state):
     return True
 
 
-def _run_write_tests(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_write_tests(config, story_id, spec_file, story_dir, log_dir, state, profile):
     if _phase_done(state, story_id, "write_tests"):
         return True
 
-    template = (config.prompts_dir / "write_tests.md").read_text()
-    context = generate_context(config)
+    template = profile.get_prompt_path("write_tests").read_text()
+    context = profile.generate_context(config)
     prompt = (
         f"{template}\n\n"
         f"## Your Task\n\n"
@@ -375,37 +392,52 @@ def _run_write_tests(config, story_id, spec_file, story_dir, log_dir, state):
         f"## Specification\n\n{spec_file.read_text()}"
     )
 
-    def cargo_check_tests():
-        result = cargo.check(config.project_dir, tests=True)
-        if not result.success:
-            log.warn(f"[{story_id}] write_tests: cargo check --tests failed — {result.summary()}")
-            if result.format_errors():
-                log.warn(result.format_errors())
-        return result.success
+    def post_check():
+        for tool_name in profile.get_phase("write_tests").post_checks:
+            result = profile.run_tool(tool_name, config.project_dir)
+            if not result.success:
+                log.warn(f"[{story_id}] write_tests: {tool_name} failed — {result.summary}")
+                if result.details:
+                    log.warn(result.details)
+                return False
+        return True
 
     return _run_phase(
         config, state, story_id, "write_tests", prompt,
-        log_dir / "write_tests.log", config.default_model, config.max_turns,
-        post_check=cargo_check_tests,
+        log_dir / "write_tests.log",
+        profile.get_model("write_tests", config),
+        profile.get_max_turns("write_tests", config),
+        post_check=post_check,
     )
 
 
-def _run_verify(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_verify(config, story_id, spec_file, story_dir, log_dir, state, profile):
     output_file = story_dir / "results.md"
     if _phase_done(state, story_id, "verify", output_file):
         return True
 
-    template = (config.prompts_dir / "verify.md").read_text()
+    template = profile.get_prompt_path("verify").read_text()
+    phase_def = profile.get_phase("verify")
+    max_retries = phase_def.max_retries or config.max_retries
 
-    for attempt in range(1, config.max_retries + 1):
+    for attempt in range(1, max_retries + 1):
         # Remove stale results so the agent can't be misled
         output_file.unlink(missing_ok=True)
 
         # 1. Environment snapshot — so the agent knows what's available
-        env_info = _probe_environment(config.project_dir)
+        env_info = profile.probe_environment(config.project_dir)
 
-        # 2. Pre-run cargo test — give the agent structured failure info upfront
-        test_passed, test_output = cargo.test_verbose(config.project_dir)
+        # 2. Pre-run tools (e.g. cargo test) — give the agent structured failure info upfront
+        test_passed = True
+        test_output = ""
+        for tool_name in phase_def.pre_run:
+            result = profile.run_tool(tool_name, config.project_dir)
+            if not result.success:
+                test_passed = False
+                test_output = result.output
+                break
+            elif not test_output:
+                test_output = result.output
 
         # 3. Git diff — so the agent knows what changed
         diff_stat = subprocess.run(
@@ -419,7 +451,7 @@ def _run_verify(config, story_id, spec_file, story_dir, log_dir, state):
             f"- Story ID: {story_id}\n"
             f"- The project code is in: {config.project_dir}/\n"
             f"- Write your results summary to: {output_file}\n"
-            f"- Maximum fix attempts: {config.max_retries}\n\n"
+            f"- Maximum fix attempts: {max_retries}\n\n"
             f"## Environment\n\n{env_info}\n\n"
         )
 
@@ -429,8 +461,8 @@ def _run_verify(config, story_id, spec_file, story_dir, log_dir, state):
         if test_passed:
             prompt += (
                 "## Initial Test Run\n\n"
-                "All tests passed. Run `cargo clippy`, fix any warnings, "
-                "and write the results summary.\n\n"
+                "All tests passed. Run any remaining checks (linters, static analysis), "
+                "fix any warnings, and write the results summary.\n\n"
             )
         else:
             prompt += (
@@ -443,21 +475,23 @@ def _run_verify(config, story_id, spec_file, story_dir, log_dir, state):
         prompt += f"## Specification (for reference)\n\n{spec_file.read_text()}"
 
         if attempt > 1:
-            log.phase(f"[{story_id}] verify: attempt {attempt}/{config.max_retries}")
+            log.phase(f"[{story_id}] verify: attempt {attempt}/{max_retries}")
 
         log_name = "verify.log" if attempt == 1 else f"verify.{attempt - 1}.log"
         ok = _run_phase(
             config, state, story_id, "verify", prompt,
-            log_dir / log_name, config.default_model, config.verify_turns,
+            log_dir / log_name,
+            profile.get_model("verify", config),
+            profile.get_max_turns("verify", config),
             output_file=output_file,
         )
 
         if ok:
             return True
 
-        if attempt < config.max_retries:
+        if attempt < max_retries:
             log.warn(
-                f"[{story_id}] verify: attempt {attempt}/{config.max_retries} failed, retrying"
+                f"[{story_id}] verify: attempt {attempt}/{max_retries} failed, retrying"
             )
             state.set_phase_status(story_id, "verify", "pending")
 
@@ -467,7 +501,7 @@ def _run_verify(config, story_id, spec_file, story_dir, log_dir, state):
 # ── Commit ───────────────────────────────────────────────────────
 
 
-def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
+def _run_commit(config, story_id, spec_file, story_dir, log_dir, state, profile):
     if _phase_done(state, story_id, "commit"):
         return True
 
@@ -521,11 +555,13 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
         f"Write to: {commit_msg_file}\n"
     )
 
+    commit_model = profile.get_model("commit", config)
+    commit_turns = profile.get_max_turns("commit", config)
     success, usage, _stalled = run_agent(
         prompt=prompt,
         log_file=log_dir / "commit.log",
-        model=config.default_model,
-        max_turns=5,
+        model=commit_model,
+        max_turns=commit_turns,
         workdir=config.project_dir,
 
         cmd=config.cmd,
@@ -540,7 +576,7 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
             cache_creation_tokens=usage.cache_creation_tokens,
             cache_read_tokens=usage.cache_read_tokens,
             num_turns=usage.num_turns,
-            model=config.fast_model,
+            model=commit_model,
         )
 
     # Read generated commit message, or fall back
@@ -574,31 +610,3 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state):
         return False
 
 
-# ── Environment probe ──────────────────────────────────────────
-
-
-def _probe_environment(project_dir: Path) -> str:
-    """Probe the container environment and return a summary for the agent."""
-    lines = []
-
-    def _run(cmd: str) -> str:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return r.stdout.strip() or r.stderr.strip()
-
-    # Rust toolchain
-    lines.append(f"- Rust: {_run('rustc --version')}")
-    lines.append(f"- Cargo: {_run('cargo --version')}")
-
-    # System tools
-    for tool in ["gcc", "ip", "unshare", "sudo", "dnsmasq", "rpmbuild", "rpmlint"]:
-        which = _run(f"which {tool} 2>/dev/null")
-        if which:
-            lines.append(f"- {tool}: {which}")
-        else:
-            lines.append(f"- {tool}: NOT available")
-
-    # User namespace support
-    userns = _run("unshare --user --net true 2>&1 && echo supported || echo unsupported")
-    lines.append(f"- User namespaces: {userns}")
-
-    return "\n".join(lines)

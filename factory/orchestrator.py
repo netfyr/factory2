@@ -12,19 +12,24 @@ from .deps import (
     topo_sort,
 )
 from .pipeline import run_story_pipeline
+from .profile import Profile
 from .runner import run_agent
 from .state import State, spec_hash, specs_combined_hash
 from .triage import compute_spec_diff, should_reprocess
 
 
-def run_factory(config: Config):
+def run_factory(config: Config, profile: Profile):
     """Main entry point: validate, init, deps, process, summarize."""
     _validate(config)
-    _init_workspace(config)
+    _init_workspace(config, profile)
     story_ids = _discover_stories(config)
     state = State(config.state_dir)
 
-    _check_prerequisites(config)
+    profile.check_prerequisites(config.cmd)
+
+    # Store profile and phase list in state for the monitor
+    state.set_metadata("profile", profile.name)
+    state.set_metadata("phase_list", profile.phase_list())
 
     # Handle --rerun: reset specified stories so they are reprocessed
     if config.rerun:
@@ -42,6 +47,7 @@ def run_factory(config: Config):
     log.info(f"  State:      {config.state_dir}")
     log.info(f"  Stories:    {len(story_ids)}")
     log.info(f"  Parallel:   {config.max_parallel}")
+    log.info(f"  Profile:    {profile.name}")
     log.info(f"  Models:     {config.strong_model} (strong), {config.default_model} (default), {config.fast_model} (fast)")
     print("", flush=True)
 
@@ -53,12 +59,12 @@ def run_factory(config: Config):
 
     # Phase 2: process stories
     if config.max_parallel > 1:
-        _process_parallel(config, state)
+        _process_parallel(config, state, profile)
     else:
-        _process_sequential(config, state)
+        _process_sequential(config, state, profile)
 
     # Phase 3: summary
-    _generate_summary(config, story_ids, state)
+    _generate_summary(config, story_ids, state, profile)
 
     # Cost report
     costs = state.get_total_costs()
@@ -104,7 +110,7 @@ output/*.log
 """
 
 
-def _init_workspace(config: Config):
+def _init_workspace(config: Config, profile: Profile):
     config.state_dir.mkdir(parents=True, exist_ok=True)
     config.stories_dir.mkdir(parents=True, exist_ok=True)
     config.project_dir.mkdir(parents=True, exist_ok=True)
@@ -125,13 +131,8 @@ def _init_workspace(config: Config):
         else:
             project_gitignore.write_text(entry + "\n")
 
-    # Init Rust project
-    if not (config.project_dir / "Cargo.toml").exists():
-        log.info("Initializing Rust project")
-        subprocess.run(
-            ["cargo", "init", "--name", "factory_project"],
-            cwd=config.project_dir, capture_output=True,
-        )
+    # Init project using the profile's init command
+    profile.init_project(config.project_dir)
 
     # Init git repo for the project
     if not (config.project_dir / ".git").exists():
@@ -151,13 +152,6 @@ def _discover_stories(config: Config) -> list[str]:
     return story_ids
 
 
-def _check_prerequisites(config: Config):
-    import shutil
-    for cmd in [config.cmd, "jq", "cargo"]:
-        if not shutil.which(cmd):
-            raise SystemExit(f"Required command not found: {cmd}")
-
-
 # ── Sequential processing ────────────────────────────────────────
 
 
@@ -170,7 +164,7 @@ def _story_needs_processing(story_id: str, config: Config, state: State) -> bool
     return old_hash != new_hash
 
 
-def _process_sequential(config: Config, state: State):
+def _process_sequential(config: Config, state: State, profile: Profile):
     order = topo_sort(config.deps_file)
     total = len(order)
     done_count = skip_count = quar_count = uptodate_count = 0
@@ -214,7 +208,7 @@ def _process_sequential(config: Config, state: State):
         state.set_spec_hash(story_id, new_hash)
         state.set_story_status(story_id, "in_progress")
 
-        if run_story_pipeline(config, story_id, spec_file, state):
+        if run_story_pipeline(config, story_id, spec_file, state, profile):
             state.set_story_status(story_id, "done")
             done_count += 1
             log.info(f"Story {story_id}: DONE")
@@ -263,7 +257,7 @@ def _find_failed_dependency(story_id: str, deps_file: Path, state: State) -> str
 # ── Parallel processing ──────────────────────────────────────────
 
 
-def _process_parallel(config: Config, state: State):
+def _process_parallel(config: Config, state: State, profile: Profile):
     order = topo_sort(config.deps_file)
 
     # Pre-compute which stories need reprocessing, cascading to dependents
@@ -309,7 +303,7 @@ def _process_parallel(config: Config, state: State):
                     status_map[sid] = "running"
                     log.info(f"Launching parallel pipeline for {sid}")
                     future = executor.submit(
-                        run_story_pipeline, config, sid, spec_file, state
+                        run_story_pipeline, config, sid, spec_file, state, profile
                     )
                     futures[future] = sid
 
@@ -353,10 +347,10 @@ def _process_parallel(config: Config, state: State):
 # ── Summary ──────────────────────────────────────────────────────
 
 
-def _generate_summary(config: Config, story_ids: list[str], state: State):
+def _generate_summary(config: Config, story_ids: list[str], state: State, profile: Profile):
     log.phase("Generating final summary...")
 
-    template = (config.prompts_dir / "summarize.md").read_text()
+    template = profile.get_prompt_path("summarize").read_text()
 
     results_section = ""
     for story_id in story_ids:

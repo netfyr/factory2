@@ -17,7 +17,7 @@ For each quarantined story: what went wrong, and the error or failure reason.
 For each skipped story: which dependency failed, causing it to be skipped.
 
 ## Project Status
-Run the project's test suite to confirm current state. Does the project compile? Do all tests pass? Report the numbers.
+Run `cargo test` to confirm current state. Does the project compile? Do all tests pass? Report the numbers.
 
 ## Architecture Notes
 Brief description of the project structure: key modules, types, and how they fit together. This is for someone picking up the project for the first time.

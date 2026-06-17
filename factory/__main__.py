@@ -5,12 +5,13 @@ from pathlib import Path
 
 from .config import Config
 from .orchestrator import run_factory
+from .profile import Profile
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="factory",
-        description="AI Software Factory — turns user stories into working Rust code.",
+        description="AI Software Factory — turns user story specifications into working code.",
     )
     parser.add_argument(
         "project_dir", type=Path,
@@ -80,6 +81,10 @@ def main():
         "--git-author-email", default=None,
         help="Git author email for commits (default: $GIT_AUTHOR_EMAIL or 'factory@localhost')",
     )
+    parser.add_argument(
+        "--profile", default=None,
+        help="Language/toolchain profile (default: auto-detect from project files)",
+    )
 
     args = parser.parse_args()
 
@@ -93,6 +98,7 @@ def main():
         project_dir=project_dir,
         specs_dir=specs_dir,
         state_dir=state_dir,
+        profile_name=args.profile or "",
         max_parallel=args.parallel,
         max_retries=args.retries,
         max_review_iterations=args.review_iterations,
@@ -111,8 +117,12 @@ def main():
         git_author_email=args.git_author_email or os.environ.get("GIT_AUTHOR_EMAIL", "factory@localhost"),
     )
 
+    # Load profile: use explicit --profile, or auto-detect from project files
+    profile_name = config.profile_name or Profile.detect(config.factory_dir, project_dir)
+    profile = Profile.load(profile_name, config.factory_dir, project_dir)
+
     try:
-        run_factory(config)
+        run_factory(config, profile)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(1)

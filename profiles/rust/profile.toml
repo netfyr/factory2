@@ -1,0 +1,112 @@
+# Rust profile — Cargo-based Rust projects.
+#
+# This is the default profile.  It captures all the language-specific
+# behavior that was previously hardcoded in the factory.
+
+name = "rust"
+description = "Rust project with Cargo"
+
+# Auto-detection: if any of these files exist in the project directory,
+# this profile is selected automatically.
+detect = ["Cargo.toml"]
+
+# Required binaries (in addition to the Claude CLI and jq, which are
+# always checked).
+prerequisites = ["cargo"]
+
+# Context generation method.  "rust" uses the built-in Rust context
+# generator (module tree, public API signatures, dependencies).
+context = "rust"
+
+# Project initialization — run this command if the check file does not
+# exist in the project directory.
+[init]
+check = "Cargo.toml"
+command = ["cargo", "init", "--name", "factory_project"]
+
+# Environment probes — injected into the verify phase prompt so the
+# agent knows what tools are available.
+[[environment]]
+label = "Rust"
+command = "rustc --version"
+
+[[environment]]
+label = "Cargo"
+command = "cargo --version"
+
+[[environment]]
+label = "gcc"
+command = "which gcc 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "ip"
+command = "which ip 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "unshare"
+command = "which unshare 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "sudo"
+command = "which sudo 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "dnsmasq"
+command = "which dnsmasq 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "rpmbuild"
+command = "which rpmbuild 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "rpmlint"
+command = "which rpmlint 2>/dev/null || echo NOT available"
+
+[[environment]]
+label = "User namespaces"
+command = "unshare --user --net true 2>&1 && echo supported || echo unsupported"
+
+# Tool definitions.  Each tool can be either a "builtin" (dispatches to
+# existing Python code) or a "command" (runs a subprocess).
+[tools.check]
+builtin = "cargo_check"
+description = "Verify code compiles"
+
+[tools.check_tests]
+builtin = "cargo_check_tests"
+description = "Verify test code compiles"
+
+[tools.test_verbose]
+builtin = "cargo_test_verbose"
+description = "Run the test suite"
+
+[tools.lint]
+builtin = "cargo_clippy"
+description = "Run clippy linter"
+
+# Phase configuration.  Each phase specifies which model tier to use
+# and optional pre/post checks.
+[phases.understand]
+model_tier = "default"
+
+[phases.plan]
+model_tier = "strong"
+
+[phases.implement]
+model_tier = "default"
+post_checks = ["check"]
+
+[phases.review]
+model_tier = "default"
+
+[phases.write_tests]
+model_tier = "default"
+post_checks = ["check_tests"]
+
+[phases.verify]
+model_tier = "default"
+pre_run = ["test_verbose"]
+
+[phases.commit]
+model_tier = "fast"
+max_turns = 5
