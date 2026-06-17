@@ -72,6 +72,10 @@ def main():
         help="Force reprocessing of the given story IDs (resets their status and phases)",
     )
     parser.add_argument(
+        "--rerun-all", action="store_true",
+        help="Force reprocessing of all stories",
+    )
+    parser.add_argument(
         "--llm-deps", action="store_true",
         help="Use LLM to analyze dependencies instead of parsing from spec files",
     )
@@ -114,6 +118,7 @@ def main():
         cmd=cmd,
         skip_permissions=os.environ.get("SKIP_PERMISSIONS", "1") == "1",
         rerun=args.rerun or [],
+        rerun_all=args.rerun_all,
         llm_deps=args.llm_deps,
         git_author_name=args.git_author_name or os.environ.get("GIT_AUTHOR_NAME", "Factory"),
         git_author_email=args.git_author_email or os.environ.get("GIT_AUTHOR_EMAIL", "factory@localhost"),

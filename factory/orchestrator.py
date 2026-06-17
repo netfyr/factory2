@@ -1,4 +1,5 @@
 import subprocess
+import tarfile
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
@@ -31,7 +32,9 @@ def run_factory(config: Config, profile: Profile):
     state.set_metadata("profile", profile.name)
     state.set_metadata("phase_list", profile.phase_list())
 
-    # Handle --rerun: reset specified stories so they are reprocessed
+    # Handle --rerun / --rerun-all: reset specified stories so they are reprocessed
+    if config.rerun_all:
+        config.rerun = list(story_ids)
     if config.rerun:
         for sid in config.rerun:
             if sid not in story_ids:
@@ -105,6 +108,7 @@ state.json.lock
 .specs_hash
 .specs-prev/
 stories/*/log/
+stories/*/log-archive/
 stories/*/commit_msg.txt
 output/*.log
 """
@@ -238,11 +242,13 @@ def _process_sequential(config: Config, state: State, profile: Profile):
         if run_story_pipeline(config, story_id, spec_file, state, profile):
             state.set_story_status(story_id, "done")
             state.end_run(story_id, "done")
+            _archive_run_logs(config, state, story_id)
             done_count += 1
             log.info(f"Story {story_id}: DONE")
         else:
             state.quarantine(story_id, "Pipeline failed")
             state.end_run(story_id, "quarantined", "Pipeline failed")
+            _archive_run_logs(config, state, story_id)
             quar_count += 1
             log.error(f"Story {story_id}: QUARANTINED")
 
@@ -273,6 +279,29 @@ def _should_cascade(story_id: str, changed_deps: list[str], config: Config, diff
             return True
 
     return False
+
+
+def _archive_run_logs(config: Config, state: State, story_id: str):
+    """Archive the current log directory into a compressed tarball keyed by run number."""
+    runs = state.get_runs(story_id)
+    if not runs:
+        return
+    run_number = runs[-1]["run"]
+
+    story_dir = config.stories_dir / story_id
+    log_files = sorted(story_dir.glob("log/*.log"))
+    if not log_files:
+        return
+
+    archive_dir = story_dir / "log-archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / f"run-{run_number}.tar.gz"
+
+    with tarfile.open(archive_path, "w:gz") as tar:
+        for lf in log_files:
+            tar.add(lf, arcname=lf.name)
+
+    log.info(f"[{story_id}] Archived logs → {archive_path}")
 
 
 def _find_failed_dependency(story_id: str, deps_file: Path, state: State) -> str | None:
@@ -346,11 +375,13 @@ def _process_parallel(config: Config, state: State, profile: Profile):
                     status_map[sid] = "done"
                     state.set_story_status(sid, "done")
                     state.end_run(sid, "done")
+                    _archive_run_logs(config, state, sid)
                     log.info(f"Story {sid}: DONE")
                 else:
                     status_map[sid] = "quarantined"
                     state.quarantine(sid, "Pipeline failed")
                     state.end_run(sid, "quarantined", "Pipeline failed")
+                    _archive_run_logs(config, state, sid)
                     log.error(f"Story {sid}: QUARANTINED")
                     # Cascade skip
                     for dep_sid in get_dependents(sid, config.deps_file):

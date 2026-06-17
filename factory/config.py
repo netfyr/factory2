@@ -22,6 +22,7 @@ class Config:
     cmd: str = "claude"        # CLI binary name/path
     skip_permissions: bool = True
     rerun: list[str] = field(default_factory=list)
+    rerun_all: bool = False
     llm_deps: bool = False
     git_author_name: str = "Factory"
     git_author_email: str = "factory@localhost"
