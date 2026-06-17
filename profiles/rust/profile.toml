@@ -34,38 +34,6 @@ command = "rustc --version"
 label = "Cargo"
 command = "cargo --version"
 
-[[environment]]
-label = "gcc"
-command = "which gcc 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "ip"
-command = "which ip 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "unshare"
-command = "which unshare 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "sudo"
-command = "which sudo 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "dnsmasq"
-command = "which dnsmasq 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "rpmbuild"
-command = "which rpmbuild 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "rpmlint"
-command = "which rpmlint 2>/dev/null || echo NOT available"
-
-[[environment]]
-label = "User namespaces"
-command = "unshare --user --net true 2>&1 && echo supported || echo unsupported"
-
 # Tool definitions.  Each tool can be either a "builtin" (dispatches to
 # existing Python code) or a "command" (runs a subprocess).
 [tools.check]

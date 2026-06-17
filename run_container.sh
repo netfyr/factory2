@@ -14,8 +14,9 @@ Arguments:
 
 Options:
   -o, --output DIR         Output directory for project and state (default: ./factory-output)
-  -i, --image NAME         Container image name (default: factory2)
-  -b, --build              Force rebuild the container image
+  -p, --profile NAME       Language/toolchain profile (default: rust)
+  -i, --image NAME         Base image name prefix (default: factory2)
+  -b, --build              Force rebuild all container image layers
   -R, --runtime CMD        Container runtime: docker or podman (default: auto-detect)
   -h, --help               Show this help
 
@@ -32,6 +33,19 @@ Factory options:
   -v, --verbose            Stream agent output to terminal in real time
   --rerun STORY [...]      Force reprocessing of specific stories
 
+Container image layers:
+  1. factory2-base          Common: Fedora, Claude CLI, git, Python, user setup
+  2. factory2-{profile}     Profile: language toolchain (e.g. rust, cargo, clippy)
+  3. factory2 (optional)    User: extra tools from <specs-dir>/Containerfile
+
+  To add project-specific tools (e.g., dnsmasq), create a Containerfile
+  alongside your specs directory:
+
+    FROM factory2-rust
+    USER root
+    RUN dnf install -y dnsmasq
+    USER factory
+
 Authentication: set EITHER Anthropic API key OR Vertex AI env vars before running.
 
   # Anthropic API
@@ -44,6 +58,7 @@ Authentication: set EITHER Anthropic API key OR Vertex AI env vars before runnin
 
 Examples:
   ./run_container.sh ./my-specs
+  ./run_container.sh ./my-specs -p python
   ./run_container.sh ./my-specs -- -j 4 --strong-model claude-opus-4-6
   ./run_container.sh ./my-specs -o ./output -- -v --fast-model claude-haiku-4-5-20251001
 EOF
@@ -53,7 +68,8 @@ EOF
 # ─── Defaults ────────────────────────────────────────────────────────
 
 OUTPUT_DIR="./factory-output"
-IMAGE_NAME="factory2"
+IMAGE_PREFIX="factory2"
+PROFILE="rust"
 FORCE_BUILD=false
 RUNTIME=""
 SPECS_DIR=""
@@ -64,7 +80,8 @@ FACTORY_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -o|--output)   OUTPUT_DIR="$2"; shift 2 ;;
-        -i|--image)    IMAGE_NAME="$2"; shift 2 ;;
+        -p|--profile)  PROFILE="$2"; shift 2 ;;
+        -i|--image)    IMAGE_PREFIX="$2"; shift 2 ;;
         -b|--build)    FORCE_BUILD=true; shift ;;
         -R|--runtime)  RUNTIME="$2"; shift 2 ;;
         -h|--help)     usage ;;
@@ -104,15 +121,47 @@ fi
 
 echo "Using container runtime: $RUNTIME"
 
-# ─── Build Image ────────────────────────────────────────────────────
+# ─── Image Names ───────────────────────────────────────────────────
+
+BASE_IMAGE="${IMAGE_PREFIX}-base"
+PROFILE_IMAGE="${IMAGE_PREFIX}-${PROFILE}"
+RUN_IMAGE="${IMAGE_PREFIX}"
+
+# ─── Build Images ──────────────────────────────────────────────────
 
 image_exists() {
-    $RUNTIME image inspect "$IMAGE_NAME" &>/dev/null 2>&1
+    $RUNTIME image inspect "$1" &>/dev/null 2>&1
 }
 
-if $FORCE_BUILD || ! image_exists; then
-    echo "Building container image '$IMAGE_NAME'..."
-    $RUNTIME build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+# Layer 1: base image
+PROFILE_CONTAINERFILE="$SCRIPT_DIR/profiles/$PROFILE/Containerfile"
+if [ ! -f "$PROFILE_CONTAINERFILE" ]; then
+    echo "ERROR: No Containerfile for profile '$PROFILE' at $PROFILE_CONTAINERFILE" >&2
+    echo "Available profiles:" >&2
+    for d in "$SCRIPT_DIR"/profiles/*/Containerfile; do
+        [ -f "$d" ] && echo "  $(basename "$(dirname "$d")")" >&2
+    done
+    exit 1
+fi
+
+if $FORCE_BUILD || ! image_exists "$BASE_IMAGE"; then
+    echo "Building base image '$BASE_IMAGE'..."
+    $RUNTIME build -t "$BASE_IMAGE" -f "$SCRIPT_DIR/Containerfile.base" "$SCRIPT_DIR"
+fi
+
+# Layer 2: profile image
+if $FORCE_BUILD || ! image_exists "$PROFILE_IMAGE"; then
+    echo "Building profile image '$PROFILE_IMAGE'..."
+    $RUNTIME build -t "$PROFILE_IMAGE" -f "$PROFILE_CONTAINERFILE" "$SCRIPT_DIR"
+fi
+
+# Layer 3: user image (optional — from specs-dir/Containerfile)
+USER_CONTAINERFILE="$SPECS_DIR/Containerfile"
+if [ -f "$USER_CONTAINERFILE" ]; then
+    echo "Building user image '$RUN_IMAGE' from $USER_CONTAINERFILE..."
+    $RUNTIME build -t "$RUN_IMAGE" -f "$USER_CONTAINERFILE" "$SPECS_DIR"
+elif [ "$PROFILE_IMAGE" != "$RUN_IMAGE" ]; then
+    $RUNTIME tag "$PROFILE_IMAGE" "$RUN_IMAGE"
 fi
 
 # ─── Validate Environment ───────────────────────────────────────────
@@ -176,12 +225,13 @@ echo ""
 echo "Starting factory..."
 echo "  Specs:       $SPECS_DIR"
 echo "  Project:     $PROJECT_DIR"
+echo "  Profile:     $PROFILE"
 echo "  Runtime:     $RUNTIME"
-echo "  Image:       $IMAGE_NAME"
+echo "  Image:       $RUN_IMAGE"
 echo ""
 
-# Inject --specs into factory args
-FACTORY_ARGS=("--specs" "/specs" "${FACTORY_ARGS[@]+"${FACTORY_ARGS[@]}"}")
+# Inject --specs and --profile into factory args
+FACTORY_ARGS=("--specs" "/specs" "--profile" "$PROFILE" "${FACTORY_ARGS[@]+"${FACTORY_ARGS[@]}"}")
 
 # Remove stale container with this name (from a previous interrupted run)
 $RUNTIME rm -f factory2-run 2>/dev/null || true
@@ -203,7 +253,7 @@ $RUNTIME run --rm \
     "${AUTH_ARGS[@]}" \
     -e SKIP_PERMISSIONS="${SKIP_PERMISSIONS:-1}" \
     -e PYTHONPATH=/factory \
-    "$IMAGE_NAME" \
+    "$RUN_IMAGE" \
     /workspace "${FACTORY_ARGS[@]+"${FACTORY_ARGS[@]}"}"
 
 echo ""

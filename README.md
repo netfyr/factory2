@@ -1,11 +1,11 @@
 # factory2
 
-An AI software factory that turns user stories into working Rust code. It reads specifications from a directory, analyzes dependencies between them, and processes each story through a multi-phase pipeline powered by Claude Code.
+An AI software factory that turns user stories into working code. It reads specifications from a directory, analyzes dependencies between them, and processes each story through a multi-phase pipeline powered by Claude Code. Language-specific behavior (build tools, checks, environment probes) is configured through **profiles**.
 
 ## How it works
 
 ```
-specs/*.md ──► dependency analysis ──► per-story pipeline ──► working Rust project
+specs/*.md ──► dependency analysis ──► per-story pipeline ──► working project
                                             │
                                             ├─ understand (gap analysis)
                                             ├─ plan (implementation design)
@@ -64,7 +64,7 @@ Token usage (input and output) is tracked per story and per phase in `state.json
 
 - Python 3.11+
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
-- Rust toolchain (`cargo`, `clippy`)
+- Language toolchain for the active profile (e.g., `cargo` and `clippy` for Rust)
 
 ## Quick start
 
@@ -261,9 +261,11 @@ usage: factory [-h] --specs DIR [--state-dir DIR]
                [--strong-model MODEL] [--default-model MODEL] [--fast-model MODEL]
                [--max-turns N] [--verify-turns N] [-v] [--llm-deps]
                [--git-author-name NAME] [--git-author-email EMAIL]
+               [--profile NAME]
                [--rerun STORY [STORY ...]]
                project-dir
 
+      --profile NAME       Language/toolchain profile (default: auto-detect)
       --specs DIR          Directory containing .md spec files (required)
       --state-dir DIR      Factory state directory (default: <project-dir>/.factory)
   -j, --parallel N         Max parallel story pipelines (default: 1)
@@ -338,18 +340,27 @@ Factory Status  14:23:07
 
 ## Running in a container
 
-For isolated execution (or when tests need root capabilities like network namespaces):
+The factory is designed to run inside a container — LLMs should not run directly on your machine. The container image is built in layers:
+
+```
+Containerfile.base              →  factory2-base    (Claude CLI, git, Python)
+profiles/rust/Containerfile     →  factory2-rust    (cargo, clippy, sccache)
+<specs-dir>/Containerfile       →  factory2         (your extra tools, optional)
+```
 
 ```bash
-# Build and run
+# Build and run (builds all layers automatically)
 export ANTHROPIC_API_KEY="sk-ant-..."  # or set Vertex AI vars
 ./run_container.sh ./specs-dir
+
+# Use a different profile
+./run_container.sh -p python ./specs-dir
 
 # Options
 ./run_container.sh \
   -o ./output-dir \        # project/output location (default: ./factory-output)
-  -i my-image \            # image name (default: factory2)
-  -b \                     # force rebuild image
+  -p rust \                # profile (default: rust)
+  -b \                     # force rebuild all layers
   -R podman \              # runtime: docker or podman (default: auto-detect)
   ./specs-dir \
   -- --strong-model claude-opus-4-6   # factory options after --
@@ -359,6 +370,19 @@ podman kill factory2-run    # or: docker kill factory2-run
 ```
 
 The container runs with `--cap-add=NET_ADMIN --cap-add=SYS_ADMIN` instead of `--privileged`. A non-root user (`factory`) runs Claude Code, with passwordless `sudo` for commands that need root (e.g., network namespaces in tests).
+
+### Adding project-specific tools
+
+If your project needs extra tools (e.g., `dnsmasq` for network tests), create a `Containerfile` alongside your specs directory:
+
+```dockerfile
+FROM factory2-rust
+USER root
+RUN dnf install -y dnsmasq
+USER factory
+```
+
+The `run_container.sh` script auto-detects this file and builds a third layer on top of the profile image. The `FROM` line must reference the profile image (e.g., `factory2-rust`, `factory2-python`).
 
 ### Vertex AI in containers
 
@@ -398,27 +422,91 @@ factory2/
 │   ├── log.py              # Colored logging
 │   ├── monitor.py          # Live status dashboard
 │   ├── orchestrator.py     # Main loop (sequential + parallel)
-│   ├── pipeline.py         # 5-phase per-story pipeline + git commit
+│   ├── pipeline.py         # Per-story pipeline + git commit
+│   ├── profile.py          # Profile loader (language/toolchain abstraction)
 │   ├── runner.py           # Claude CLI wrapper (streams output, parses usage)
 │   ├── state.py            # JSON state with file locking + cost tracking
 │   └── triage.py           # Spec diff relevance check for cascade invalidation
-├── prompts/                # Prompt templates (plain markdown)
+├── profiles/               # Language/toolchain profiles
+│   └── rust/
+│       ├── profile.toml    # Rust profile (tools, phases, probes)
+│       ├── Containerfile   # Rust container layer (cargo, clippy, sccache)
+│       └── prompts/        # Rust-specific prompt templates
+├── prompts/                # Generic default prompt templates
 │   ├── understand.md
 │   ├── plan.md
 │   ├── implement.md
+│   ├── review.md
 │   ├── write_tests.md
 │   ├── verify.md
 │   ├── summarize.md
 │   └── analyze_deps.md
 ├── pyproject.toml          # Python project config (no external deps)
-├── Containerfile           # Container image definition
+├── Containerfile.base      # Base container image (Claude CLI, git, Python)
 ├── entrypoint.sh           # Container entry point
-└── run_container.sh        # Container launcher
+└── run_container.sh        # Container launcher (layered build)
 ```
+
+## Profiles
+
+Profiles abstract language-specific behavior (build tools, post-checks, environment probes, project initialization) into declarative TOML files. The factory ships with a `rust` profile; you can create additional profiles for other languages.
+
+### Auto-detection
+
+The factory auto-detects the profile from the project directory. Each profile declares `detect` files (e.g., `Cargo.toml` for Rust). If none match, it falls back to `rust`. Override with `--profile NAME`.
+
+### Profile structure
+
+Profiles live in `profiles/<name>/profile.toml`:
+
+```toml
+name = "rust"
+description = "Rust project with Cargo"
+detect = ["Cargo.toml"]
+prerequisites = ["cargo"]
+context = "rust"
+
+[init]
+check = "Cargo.toml"
+command = ["cargo", "init", "--name", "factory_project"]
+
+[[environment]]
+label = "Rust"
+command = "rustc --version"
+
+[tools.check]
+builtin = "cargo_check"
+description = "Verify code compiles"
+
+[tools.test_verbose]
+command = ["cargo", "test", "--verbose"]
+description = "Run the test suite"
+
+[phases.implement]
+model_tier = "default"
+post_checks = ["check"]
+
+[phases.verify]
+model_tier = "default"
+pre_run = ["test_verbose"]
+```
+
+Tools can be `builtin` (dispatches to existing Python functions) or `command` (runs a subprocess). Phase `model_tier` maps to `strong`/`default`/`fast` models passed via CLI flags.
+
+### Project-level overrides
+
+Place prompt overrides in `<project-dir>/.factory/profile/prompts/<phase>.md`. These take priority over the profile's prompts, which in turn take priority over the factory defaults in `prompts/`.
+
+The resolution order for prompts is:
+1. `<project-dir>/.factory/profile/prompts/<phase>.md`
+2. `profiles/<name>/prompts/<phase>.md`
+3. `prompts/<phase>.md`
 
 ## Customizing prompts
 
-Edit the files in `prompts/` to adjust how Claude approaches each phase. The prompts are plain markdown — the orchestrator appends task-specific context (spec content, file paths, previous phase outputs) at the end before sending to Claude.
+The `prompts/` directory contains generic, language-agnostic prompt templates. Profile-specific prompts live in `profiles/<name>/prompts/` (e.g., the Rust profile has Rust-specific prompts in `profiles/rust/prompts/`). The resolution order is: project override > profile-specific > factory default.
+
+To customize prompts for a profile, edit the files in `profiles/<name>/prompts/`. To customize for a specific project, place overrides in `<project-dir>/.factory/profile/prompts/`. The prompts are plain markdown — the orchestrator appends task-specific context (spec content, file paths, previous phase outputs) at the end before sending to Claude.
 
 ## Scalability
 
@@ -446,5 +534,5 @@ The factory is designed to handle large spec sets (100+ stories) efficiently.
 
 ## Limitations
 
-- Designed for Rust projects. Supporting other languages requires adjusting the prompts and the `cargo check` post-conditions in `factory/pipeline.py`.
+- Currently ships with a Rust profile only. Supporting other languages requires creating a new profile (TOML + optional prompt overrides) — no Python code changes needed for simple cases.
 - Parallel mode (`-j N > 1`) can produce merge conflicts if two stories modify the same file. Sequential mode is safer for tightly coupled stories.

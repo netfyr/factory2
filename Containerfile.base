@@ -1,17 +1,13 @@
 FROM fedora:42
 
-# Install Rust toolchain, RPM build tooling, and system packages
+# Common packages needed by the factory and Claude Code
 RUN dnf install -y \
-    rust cargo clippy rustfmt sccache dnsmasq util-linux \
-    rpm-build rpmlint cargo-rpm-macros systemd-rpm-macros \
     nodejs npm \
     python3 \
     jq git sudo which \
-    iproute iptables-nft \
-    gcc \
     && dnf clean all
 
-# Install coding agent CLIs
+# Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code && \
     npm cache clean --force && \
     rm -rf /tmp/* /root/.npm /root/.cache
@@ -43,7 +39,6 @@ RUN useradd -m -s /bin/bash factory && \
 
 USER factory
 ENV NODE_COMPILE_CACHE=""
-ENV RUSTC_WRAPPER=sccache
 
 WORKDIR /workspace
 

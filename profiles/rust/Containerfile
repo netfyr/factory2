@@ -1,0 +1,9 @@
+FROM factory2-base
+
+USER root
+RUN dnf install -y \
+    rust cargo clippy rustfmt sccache gcc \
+    && dnf clean all
+USER factory
+
+ENV RUSTC_WRAPPER=sccache
