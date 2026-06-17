@@ -164,24 +164,48 @@ def _story_needs_processing(story_id: str, config: Config, state: State) -> bool
     return old_hash != new_hash
 
 
+def _detect_trigger(story_id: str, config: Config, state: State) -> str:
+    """Determine why a story needs processing."""
+    if story_id in config.rerun:
+        return "rerun"
+    status = state.get_story_status(story_id)
+    if status in ("quarantined", "skipped"):
+        return "quarantine_retry"
+    old_hash = state.get_spec_hash(story_id)
+    new_hash = spec_hash(config.specs_dir / f"{story_id}.md")
+    if old_hash and old_hash != new_hash:
+        return "spec_changed"
+    if status == "in_progress":
+        return "interrupted_retry"
+    return "initial"
+
+
+def _compute_needs_processing(config, state, order):
+    """Pre-compute which stories need reprocessing and their triggers."""
+    needs_processing = set()
+    triggers = {}
+    diff_cache = {}
+    for sid in order:
+        if _story_needs_processing(sid, config, state):
+            needs_processing.add(sid)
+            triggers[sid] = _detect_trigger(sid, config, state)
+        elif any(dep in needs_processing for dep in get_dependencies(sid, config.deps_file)):
+            changed_deps = [d for d in get_dependencies(sid, config.deps_file) if d in needs_processing]
+            if _should_cascade(sid, changed_deps, config, diff_cache):
+                needs_processing.add(sid)
+                triggers[sid] = "cascade"
+                log.info(f"Invalidating {sid}: dependency change is relevant")
+            else:
+                log.info(f"Skipping {sid}: dependency change is irrelevant (triage)")
+    return needs_processing, triggers
+
+
 def _process_sequential(config: Config, state: State, profile: Profile):
     order = topo_sort(config.deps_file)
     total = len(order)
     done_count = skip_count = quar_count = uptodate_count = 0
 
-    # Pre-compute which stories need reprocessing, cascading to dependents
-    needs_processing = set()
-    diff_cache = {}  # dep_id -> diff string (cached across stories)
-    for sid in order:
-        if _story_needs_processing(sid, config, state):
-            needs_processing.add(sid)
-        elif any(dep in needs_processing for dep in get_dependencies(sid, config.deps_file)):
-            changed_deps = [d for d in get_dependencies(sid, config.deps_file) if d in needs_processing]
-            if _should_cascade(sid, changed_deps, config, diff_cache):
-                needs_processing.add(sid)
-                log.info(f"Invalidating {sid}: dependency change is relevant")
-            else:
-                log.info(f"Skipping {sid}: dependency change is irrelevant (triage)")
+    needs_processing, triggers = _compute_needs_processing(config, state, order)
 
     for i, story_id in enumerate(order, 1):
         log.info(f"{'━' * 3} Story: {story_id} ({i}/{total}) {'━' * 3}")
@@ -208,12 +232,17 @@ def _process_sequential(config: Config, state: State, profile: Profile):
         state.set_spec_hash(story_id, new_hash)
         state.set_story_status(story_id, "in_progress")
 
+        trigger = triggers.get(story_id, "initial")
+        state.begin_run(story_id, trigger, new_hash)
+
         if run_story_pipeline(config, story_id, spec_file, state, profile):
             state.set_story_status(story_id, "done")
+            state.end_run(story_id, "done")
             done_count += 1
             log.info(f"Story {story_id}: DONE")
         else:
             state.quarantine(story_id, "Pipeline failed")
+            state.end_run(story_id, "quarantined", "Pipeline failed")
             quar_count += 1
             log.error(f"Story {story_id}: QUARANTINED")
 
@@ -260,19 +289,7 @@ def _find_failed_dependency(story_id: str, deps_file: Path, state: State) -> str
 def _process_parallel(config: Config, state: State, profile: Profile):
     order = topo_sort(config.deps_file)
 
-    # Pre-compute which stories need reprocessing, cascading to dependents
-    needs_processing = set()
-    diff_cache = {}
-    for sid in order:
-        if _story_needs_processing(sid, config, state):
-            needs_processing.add(sid)
-        elif any(dep in needs_processing for dep in get_dependencies(sid, config.deps_file)):
-            changed_deps = [d for d in get_dependencies(sid, config.deps_file) if d in needs_processing]
-            if _should_cascade(sid, changed_deps, config, diff_cache):
-                needs_processing.add(sid)
-                log.info(f"Invalidating {sid}: dependency change is relevant")
-            else:
-                log.info(f"Skipping {sid}: dependency change is irrelevant (triage)")
+    needs_processing, triggers = _compute_needs_processing(config, state, order)
 
     status_map = {}
     for sid in order:
@@ -300,6 +317,10 @@ def _process_parallel(config: Config, state: State, profile: Profile):
                         state.clear_phases(sid)
                     state.set_spec_hash(sid, new_hash)
                     state.set_story_status(sid, "in_progress")
+
+                    trigger = triggers.get(sid, "initial")
+                    state.begin_run(sid, trigger, new_hash)
+
                     status_map[sid] = "running"
                     log.info(f"Launching parallel pipeline for {sid}")
                     future = executor.submit(
@@ -324,10 +345,12 @@ def _process_parallel(config: Config, state: State, profile: Profile):
                 if success:
                     status_map[sid] = "done"
                     state.set_story_status(sid, "done")
+                    state.end_run(sid, "done")
                     log.info(f"Story {sid}: DONE")
                 else:
                     status_map[sid] = "quarantined"
                     state.quarantine(sid, "Pipeline failed")
+                    state.end_run(sid, "quarantined", "Pipeline failed")
                     log.error(f"Story {sid}: QUARANTINED")
                     # Cascade skip
                     for dep_sid in get_dependents(sid, config.deps_file):

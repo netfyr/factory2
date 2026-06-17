@@ -122,6 +122,66 @@ class State:
             story["skip_reason"] = reason
         self._update(update)
 
+    # ── Run history ──────────────────────────────────────────────
+
+    def begin_run(self, story_id: str, trigger: str, spec_hash_val: str):
+        """Open a new run entry. Closes any orphaned previous run first."""
+        ts = datetime.now().isoformat()
+
+        def update(data):
+            story = self._ensure_story(data, story_id)
+            runs = story.setdefault("runs", [])
+            if runs and "finished_at" not in runs[-1]:
+                runs[-1]["outcome"] = "interrupted"
+                runs[-1]["finished_at"] = None
+            runs.append({
+                "run": len(runs) + 1,
+                "started_at": ts,
+                "trigger": trigger,
+                "spec_hash": spec_hash_val,
+            })
+        self._update(update)
+
+    def end_run(self, story_id: str, outcome: str, quarantine_reason: str | None = None):
+        """Close the current run with outcome, duration, and cost snapshot."""
+        ts = datetime.now().isoformat()
+
+        def update(data):
+            story = self._ensure_story(data, story_id)
+            runs = story.get("runs", [])
+            if not runs:
+                return
+            run = runs[-1]
+            run["finished_at"] = ts
+            run["outcome"] = outcome
+            if quarantine_reason:
+                run["quarantine_reason"] = quarantine_reason
+            try:
+                t0 = datetime.fromisoformat(run["started_at"])
+                t1 = datetime.fromisoformat(ts)
+                run["duration_s"] = round((t1 - t0).total_seconds())
+            except (ValueError, TypeError, KeyError):
+                pass
+            run["costs"] = dict(story.get("costs", {}))
+            story["costs"] = {}
+        self._update(update)
+
+    def close_interrupted_runs(self):
+        """Close all open runs across all stories as interrupted."""
+        ts = datetime.now().isoformat()
+
+        def update(data):
+            for story in data.get("stories", {}).values():
+                runs = story.get("runs", [])
+                if runs and "finished_at" not in runs[-1]:
+                    runs[-1]["outcome"] = "interrupted"
+                    runs[-1]["finished_at"] = ts
+        self._update(update)
+
+    def get_runs(self, story_id: str) -> list[dict]:
+        data = self._read()
+        return data.get("stories", {}).get(story_id, {}).get("runs", [])
+
     # ── Cost tracking ────────────────────────────────────────────
 
     def add_cost(

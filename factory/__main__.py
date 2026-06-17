@@ -1,11 +1,13 @@
 import argparse
 import os
+import signal
 import sys
 from pathlib import Path
 
 from .config import Config
 from .orchestrator import run_factory
 from .profile import Profile
+from .state import State
 
 
 def main():
@@ -121,9 +123,19 @@ def main():
     profile_name = config.profile_name or Profile.detect(config.factory_dir, project_dir)
     profile = Profile.load(profile_name, config.factory_dir, project_dir)
 
+    state = State(config.state_dir)
+
+    def _sigterm_handler(signum, frame):
+        print("\nSIGTERM received, closing open runs...", file=sys.stderr)
+        state.close_interrupted_runs()
+        sys.exit(143)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     try:
         run_factory(config, profile)
     except KeyboardInterrupt:
+        state.close_interrupted_runs()
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(1)
 

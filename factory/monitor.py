@@ -5,6 +5,8 @@ Usage:
     python -m factory.monitor <project-dir> tail          # tail all active logs
     python -m factory.monitor <project-dir> tail story-id # tail one story's logs
     python -m factory.monitor <project-dir> once          # single status snapshot
+    python -m factory.monitor <project-dir> history       # run history summary
+    python -m factory.monitor <project-dir> history story  # detailed history for one story
 
 The monitor auto-detects the state directory: it checks <path>/.factory/
 first, then falls back to <path> itself.
@@ -366,6 +368,182 @@ def show_status(state_dir: Path):
                 print(f"    {CYAN}{rel}{NC} ({format_tokens(size)}B)")
 
 
+def _format_duration_long(seconds: int | float) -> str:
+    """Format seconds as human-readable duration: '12m 30s', '1h 05m', etc."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    h = s // 3600
+    m = (s % 3600) // 60
+    return f"{h}h {m:02d}m"
+
+
+_TRIGGER_LABELS = {
+    "initial": "initial",
+    "rerun": "manual rerun",
+    "spec_changed": "spec changed",
+    "cascade": "dependency changed",
+    "quarantine_retry": "retry after quarantine",
+    "interrupted_retry": "retry after interruption",
+}
+
+_OUTCOME_COLORS = {
+    "done": GREEN,
+    "quarantined": RED,
+    "interrupted": YELLOW,
+}
+
+
+def show_history(state_dir: Path, story_filter: str = ""):
+    state_file = state_dir / "state.json"
+    if not state_file.exists():
+        print("No state.json found.")
+        return
+
+    data = json.loads(state_file.read_text())
+    stories = data.get("stories", {})
+
+    if story_filter:
+        # Detailed view for a single story
+        if story_filter not in stories:
+            print(f"Story '{story_filter}' not found.")
+            available = [sid for sid in sorted(stories) if stories[sid].get("runs")]
+            if available:
+                print("Stories with run history:")
+                for sid in available:
+                    print(f"  {sid}")
+            return
+
+        story = stories[story_filter]
+        runs = story.get("runs", [])
+        if not runs:
+            print(f"No run history for {story_filter}.")
+            return
+
+        print(f"\n{BOLD}Run history for {story_filter}{NC} ({len(runs)} run{'s' if len(runs) != 1 else ''})")
+        print(f"{DIM}{'━' * 60}{NC}\n")
+
+        total_duration = 0
+        total_cost = 0.0
+
+        for run in runs:
+            num = run.get("run", "?")
+            trigger = _TRIGGER_LABELS.get(run.get("trigger", ""), run.get("trigger", "unknown"))
+            outcome = run.get("outcome", "unknown")
+            outcome_color = _OUTCOME_COLORS.get(outcome, "")
+
+            print(f"{BOLD}Run {num}{NC} — {trigger}", end="")
+            print(f"  {outcome_color}{outcome.upper()}{NC}")
+
+            started = run.get("started_at", "")
+            if started:
+                try:
+                    dt = datetime.fromisoformat(started)
+                    print(f"  Started:  {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                except ValueError:
+                    print(f"  Started:  {started}")
+
+            duration = run.get("duration_s")
+            if duration is not None:
+                print(f"  Duration: {_format_duration_long(duration)}")
+                total_duration += duration
+            elif run.get("finished_at") is None and outcome == "interrupted":
+                print(f"  Duration: {DIM}(interrupted){NC}")
+
+            reason = run.get("quarantine_reason")
+            if reason:
+                print(f"  Reason:   {reason}")
+
+            costs = run.get("costs", {})
+            if costs:
+                run_in = sum(
+                    c.get("input_tokens", 0) + c.get("cache_creation_tokens", 0) + c.get("cache_read_tokens", 0)
+                    for c in costs.values()
+                )
+                run_out = sum(c.get("output_tokens", 0) for c in costs.values())
+                run_est = sum(_estimate_cost(c) for c in costs.values())
+                total_cost += run_est
+                print(f"  Tokens:   {format_tokens(run_in)} in / {format_tokens(run_out)} out (~${run_est:.2f})")
+
+            spec_hash = run.get("spec_hash", "")
+            if spec_hash:
+                print(f"  Spec:     {spec_hash[:12]}...")
+
+            print()
+
+        # Totals
+        print(f"{DIM}{'─' * 60}{NC}")
+        parts = [f"{len(runs)} run{'s' if len(runs) != 1 else ''}"]
+        if total_duration:
+            parts.append(_format_duration_long(total_duration))
+        if total_cost:
+            parts.append(f"~${total_cost:.2f}")
+        print(f"{BOLD}Totals:{NC} {', '.join(parts)}")
+        print()
+
+    else:
+        # Summary table of all stories
+        sorted_sids = sorted(stories.keys())
+        has_any_runs = any(stories[sid].get("runs") for sid in sorted_sids)
+
+        if not has_any_runs:
+            print("No run history recorded yet.")
+            return
+
+        print(f"\n{BOLD}Factory Run History{NC}")
+        print(f"{DIM}{'━' * 70}{NC}\n")
+
+        name_width = min(max((len(sid) for sid in sorted_sids), default=20) + 2, 40)
+        header = f"  {BOLD}{'STORY':<{name_width}}{'RUNS':>6}  {'CURRENT':<15}{'LAST RUN':<20}{'COST':>10}{NC}"
+        print(header)
+        print(f"  {DIM}{'─' * (name_width + 53)}{NC}")
+
+        for sid in sorted_sids:
+            story = stories[sid]
+            runs = story.get("runs", [])
+            status = story.get("status", "pending")
+
+            if not runs:
+                continue
+
+            last_run = runs[-1]
+            last_time = ""
+            if last_run.get("finished_at"):
+                try:
+                    dt = datetime.fromisoformat(last_run["finished_at"])
+                    last_time = dt.strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    pass
+            elif last_run.get("started_at"):
+                try:
+                    dt = datetime.fromisoformat(last_run["started_at"])
+                    last_time = dt.strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    pass
+
+            total_cost = 0.0
+            for run in runs:
+                for c in run.get("costs", {}).values():
+                    total_cost += _estimate_cost(c)
+
+            cost_str = f"~${total_cost:.2f}" if total_cost else ""
+
+            status_vis = _visible_len(status)
+            status_pad = 15 - status_vis
+            line = (
+                f"  {sid:<{name_width}}"
+                f"{len(runs):>6}  "
+                f"{colored_status(status)}{' ' * max(status_pad, 1)}"
+                f"{last_time:<20}"
+                f"{cost_str:>10}"
+            )
+            print(line)
+
+        print()
+
+
 def dashboard_loop(state_dir: Path):
     try:
         while True:
@@ -432,8 +610,8 @@ def main():
     parser.add_argument("path", type=Path, help="Project directory or state directory")
     parser.add_argument(
         "action", nargs="?", default="status",
-        choices=["status", "tail", "once"],
-        help="status (live dashboard), tail (follow logs), once (single snapshot)",
+        choices=["status", "tail", "once", "history"],
+        help="status (live dashboard), tail (follow logs), once (single snapshot), history (run history)",
     )
     parser.add_argument("story_filter", nargs="?", default="", help="Filter to a specific story")
 
@@ -446,6 +624,8 @@ def main():
         tail_logs(state_dir, args.story_filter)
     elif args.action == "once":
         show_status(state_dir)
+    elif args.action == "history":
+        show_history(state_dir, args.story_filter)
 
 
 if __name__ == "__main__":
