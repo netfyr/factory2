@@ -44,6 +44,8 @@ def run_factory(config: Config, profile: Profile):
             state.set_story_status(sid, "pending")
             log.info(f"--rerun: reset {sid} for reprocessing")
 
+    _seed_spec_snapshots(config, state, story_ids)
+
     log.info("Factory starting")
     log.info(f"  Project:    {config.project_dir}")
     log.info(f"  Specs:      {config.specs_dir}")
@@ -526,6 +528,33 @@ def _generate_summary(config: Config, story_ids: list[str], state: State, profil
 
 
 # ── Spec snapshot & state auto-commit ───────────────────────────
+
+
+def _seed_spec_snapshots(config: Config, state: State, story_ids: list[str]):
+    """Seed .specs-prev/ for completed stories that have no snapshot yet.
+
+    This handles upgrading from an older factory version that didn't
+    create per-story snapshots, so that holistic triage can compute
+    diffs on the next run.
+    """
+    import shutil
+
+    prev_dir = config.state_dir / ".specs-prev"
+    seeded = 0
+    for sid in story_ids:
+        if state.get_story_status(sid) != "done":
+            continue
+        snapshot = prev_dir / f"{sid}.md"
+        if snapshot.exists():
+            continue
+        spec_file = config.specs_dir / f"{sid}.md"
+        if not spec_file.exists():
+            continue
+        prev_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(spec_file, snapshot)
+        seeded += 1
+    if seeded:
+        log.info(f"Seeded {seeded} spec snapshot(s) for existing completed stories")
 
 
 def _snapshot_story_spec(config: Config, story_id: str):
