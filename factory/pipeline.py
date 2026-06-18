@@ -1,3 +1,4 @@
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -29,6 +30,25 @@ def _co_author_trailer(model: str) -> str:
     """Build a Co-Authored-By trailer for the given model."""
     display = _format_model_display(model)
     return f"Co-Authored-By: {display} <noreply@anthropic.com>"
+
+
+def _extract_commit_msg_from_log(log_file: Path) -> str | None:
+    """Extract commit message from agent text output when it didn't use Write."""
+    if not log_file.exists():
+        return None
+    try:
+        with open(log_file) as f:
+            for line in f:
+                obj = json.loads(line)
+                if obj.get("type") == "result" and obj.get("subtype") == "success":
+                    text = obj.get("result", "").strip()
+                    if text:
+                        text = re.sub(r"^```\w*\n?", "", text)
+                        text = re.sub(r"\n?```$", "", text)
+                        return text.strip() or None
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
 
 
 def run_story_pipeline(
@@ -655,9 +675,9 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state, profile)
     commit_msg_file = story_dir / "commit_msg.txt"
     commit_msg_file.unlink(missing_ok=True)
     prompt = (
-        "Write a git commit message to the file specified below. "
-        "Output ONLY the commit message file, nothing else.\n\n"
-        "Format:\n"
+        "Your ONLY task: use the Write tool to create the file shown below. "
+        "Do NOT output the commit message as text — you MUST use the Write tool.\n\n"
+        "The file content must be a git commit message with this format:\n"
         "- Line 1: subject (max 72 chars, imperative mood, no period, no prefix)\n"
         "- Line 2: blank\n"
         "- Body: 2-4 sentences explaining what was implemented and why\n"
@@ -693,12 +713,16 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state, profile)
             model=commit_model,
         )
 
-    # Read generated commit message, or fall back
+    # Read generated commit message, or extract from agent text output
     if commit_msg_file.exists():
         commit_msg = commit_msg_file.read_text().strip()
     else:
-        commit_msg = f"{spec_title}\n\nStory: {story_id}"
-        log.warn(f"[{story_id}] Commit: LLM did not produce message, using fallback")
+        commit_msg = _extract_commit_msg_from_log(log_dir / "commit.log")
+        if commit_msg:
+            log.info(f"[{story_id}] Commit: extracted message from agent text output")
+        else:
+            commit_msg = f"{spec_title}\n\nStory: {story_id}"
+            log.warn(f"[{story_id}] Commit: LLM did not produce message, using fallback")
 
     # Append Co-Authored-By trailer for the model that wrote the code
     trailer = _co_author_trailer(config.strong_model)
