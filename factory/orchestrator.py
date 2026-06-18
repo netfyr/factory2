@@ -79,8 +79,8 @@ def run_factory(config: Config, profile: Profile):
             f"{costs['output_tokens']:,} output"
         )
 
-    # Snapshot specs for next-run triage diffing
-    _snapshot_specs(config)
+    # Remove orphan spec snapshots for deleted stories
+    _cleanup_orphan_snapshots(config, story_ids)
 
     # Auto-commit state if state_dir has its own git context
     _auto_commit_state(config)
@@ -242,6 +242,7 @@ def _process_sequential(config: Config, state: State, profile: Profile):
         if run_story_pipeline(config, story_id, spec_file, state, profile):
             state.set_story_status(story_id, "done")
             state.end_run(story_id, "done")
+            _snapshot_story_spec(config, story_id)
             _archive_run_logs(config, state, story_id)
             done_count += 1
             log.info(f"Story {story_id}: DONE")
@@ -375,6 +376,7 @@ def _process_parallel(config: Config, state: State, profile: Profile):
                     status_map[sid] = "done"
                     state.set_story_status(sid, "done")
                     state.end_run(sid, "done")
+                    _snapshot_story_spec(config, sid)
                     _archive_run_logs(config, state, sid)
                     log.info(f"Story {sid}: DONE")
                 else:
@@ -448,17 +450,30 @@ def _generate_summary(config: Config, story_ids: list[str], state: State, profil
 # ── Spec snapshot & state auto-commit ───────────────────────────
 
 
-def _snapshot_specs(config: Config):
-    """Copy current specs to state_dir/.specs-prev/ for next-run triage diffing."""
+def _snapshot_story_spec(config: Config, story_id: str):
+    """Copy a single story's spec to .specs-prev/ after successful processing."""
     import shutil
 
-    prev_dir = config.state_dir / ".specs-prev"
-    if prev_dir.exists():
-        shutil.rmtree(prev_dir)
-    prev_dir.mkdir(parents=True, exist_ok=True)
+    spec_file = config.specs_dir / f"{story_id}.md"
+    if not spec_file.exists():
+        return
 
-    for spec_file in config.specs_dir.glob("*.md"):
-        shutil.copy2(spec_file, prev_dir / spec_file.name)
+    prev_dir = config.state_dir / ".specs-prev"
+    prev_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(spec_file, prev_dir / spec_file.name)
+
+
+def _cleanup_orphan_snapshots(config: Config, story_ids: list[str]):
+    """Remove .specs-prev/ entries for specs that no longer exist."""
+    prev_dir = config.state_dir / ".specs-prev"
+    if not prev_dir.exists():
+        return
+
+    current_ids = set(story_ids)
+    for snapshot in prev_dir.glob("*.md"):
+        if snapshot.stem not in current_ids:
+            snapshot.unlink()
+            log.info(f"Removed orphan spec snapshot: {snapshot.name}")
 
 
 def _auto_commit_state(config: Config):
