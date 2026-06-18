@@ -1,34 +1,44 @@
 # factory2
 
-An AI software factory that turns user stories into working code. It reads specifications from a directory, analyzes dependencies between them, and processes each story through a multi-phase pipeline powered by Claude Code. Language-specific behavior (build tools, checks, environment probes) is configured through **profiles**.
+An AI software factory that turns user stories into working code. It reads specifications from a directory, analyzes dependencies between them, and triages spec changes to choose between a full 7-phase pipeline or a lighter incremental pipeline — saving tokens and time when only small adjustments are needed. Language-specific behavior (build tools, checks, environment probes) is configured through **profiles**.
 
 ## How it works
 
 ```
-specs/*.md ──► dependency analysis ──► per-story pipeline ──► working project
+specs/*.md ──► dependency analysis ──► holistic triage ──► per-story pipeline ──► working project
+                                            │                     │
+                                            │               FULL: 7 phases
+                                            │                     ├─ understand
+                                            │                     ├─ plan
+                                            │                     ├─ implement
+                                            │                     ├─ review
+                                            │                     ├─ write-tests
+                                            │                     ├─ verify
+                                            │                     └─ commit
                                             │
-                                            ├─ understand (gap analysis)
-                                            ├─ plan (implementation design)
-                                            ├─ implement (write code)
-                                            ├─ review (spec adherence + correctness)
-                                            ├─ write-tests (from acceptance criteria)
-                                            ├─ verify (run tests, fix, repeat)
-                                            └─ commit (git commit with summary)
+                                            │               INCREMENTAL: 4 phases
+                                            │                     ├─ plan-delta
+                                            │                     ├─ implement
+                                            │                     ├─ verify
+                                            │                     └─ commit
+                                            │
+                                            └── SKIP: no reprocessing needed
 ```
 
-1. **Dependency analysis** — the factory parses `## Depends on` sections from each spec file to build a dependency graph (`deps.json`), determining which stories must be implemented first. This is deterministic and instant — no LLM call required.
+1. **Dependency analysis** — the factory parses `## Depends on` sections from each spec file to build a dependency graph (`deps.json`), determining which stories must be implemented first. This is deterministic and instant — no LLM call required. Dependencies are used for first-run ordering; re-processing decisions on subsequent runs are handled by holistic triage (see below).
 
-2. **Per-story pipeline** — each story passes through six phases, each a separate Claude Code invocation:
+2. **Per-story pipeline** — each story passes through up to seven phases, each a separate Claude Code invocation. Stories that have never been processed always get the full pipeline. Previously completed stories whose spec changed go through holistic triage, which decides between the full pipeline, the incremental pipeline (4 phases), or skipping entirely:
 
-   | Phase | Input | Output | Purpose |
-   |-------|-------|--------|---------|
-   | understand | spec + codebase | `understand.md` | Gap analysis: what exists, what's missing |
-   | plan | spec + understand.md | `plan.md` | Concrete implementation plan with file paths and signatures |
-   | implement | spec + plan.md | Rust code | Write the code, ensure it compiles |
-   | review | spec + plan + code | `review.md` | Check spec adherence, correctness, edge cases |
-   | write-tests | spec + code | Test code | Tests derived from acceptance criteria |
-   | verify | spec + code + tests | `results.md` | Run tests, fix failures, report results |
-   | commit | results.md | git commit | Commit with message explaining what and why |
+   | Phase | Input | Output | Purpose | Pipeline |
+   |-------|-------|--------|---------|----------|
+   | understand | spec + codebase | `understand.md` | Gap analysis: what exists, what's missing | full |
+   | plan | spec + understand.md | `plan.md` | Concrete implementation plan with file paths and signatures | full |
+   | plan_delta | spec diff + plan.md + understand.md | `plan_delta.md` | Surgical delta plan for small changes | incremental |
+   | implement | spec + plan.md (or plan_delta.md) | code | Write the code, ensure it compiles | both |
+   | review | spec + plan + code | `review.md` | Check spec adherence, correctness, edge cases | full |
+   | write-tests | spec + code | Test code | Tests derived from acceptance criteria | full |
+   | verify | spec + code + tests | `results.md` | Run tests, fix failures, report results | both |
+   | commit | results.md | git commit | Commit with message explaining what and why | both |
 
    The review phase produces a verdict (PASS or NEEDS_REVISION). On NEEDS_REVISION, the implement phase re-runs with the review feedback, then review runs again — up to `--review-iterations` times (default 2). After exhausting iterations, the pipeline proceeds to write-tests regardless. This catches design-level issues before the more expensive test-fix-retry loop in verify.
 
@@ -42,10 +52,16 @@ specs/*.md ──► dependency analysis ──► per-story pipeline ──► 
 
 ### Incremental runs
 
-Run the factory again on the same workspace and it will:
-- Skip stories that completed successfully and whose spec hasn't changed.
-- Re-attempt quarantined and skipped stories (in case specs were fixed).
-- Re-run dependency analysis only if any spec file changed.
+Run the factory again on the same workspace and it triages each story:
+
+1. **Always full pipeline** — stories that are new, in progress, quarantined, skipped, or explicitly `--rerun`'d always get the full 7-phase pipeline. No triage needed.
+
+2. **Holistic triage** — previously completed stories whose spec changed (or whose dependency's spec changed) are triaged in a single LLM call. The triage reads all spec diffs at once and decides per story:
+   - **FULL** — substantial changes (new/removed APIs, changed data models, foundational rewrites). Runs the full 7-phase pipeline.
+   - **INCREMENTAL** — minor changes (keyword fixes, localized additions, cosmetic adjustments). Runs a lighter 4-phase pipeline: plan_delta → implement → verify → commit. The plan-delta phase reads the spec diff alongside the existing understand.md and plan.md from the prior run, producing a focused delta plan instead of re-analyzing from scratch.
+   - **SKIP** — irrelevant changes (dependency spec changed but doesn't affect this story). No reprocessing.
+
+3. **Auto-escalation** — if the incremental pipeline fails or the plan-delta agent determines the change is too large (by writing `ESCALATE:` in its output), the factory automatically retries with the full pipeline.
 
 To force reprocessing of specific stories (even if their spec hasn't changed):
 
@@ -54,7 +70,7 @@ python3 -m factory ./my-project --rerun 045-rpm-packaging
 python3 -m factory ./my-project --rerun 045-rpm-packaging 048-readme
 ```
 
-This resets their status and phases, then runs the normal pipeline. Stories that depend on a rerun story are automatically invalidated and reprocessed too.
+This resets their status and phases, then runs the full pipeline.
 
 ### Cost tracking
 
@@ -426,7 +442,7 @@ factory2/
 │   ├── profile.py          # Profile loader (language/toolchain abstraction)
 │   ├── runner.py           # Claude CLI wrapper (streams output, parses usage)
 │   ├── state.py            # JSON state with file locking + cost tracking
-│   └── triage.py           # Spec diff relevance check for cascade invalidation
+│   └── triage.py           # Holistic triage (full vs incremental vs skip)
 ├── profiles/               # Language/toolchain profiles
 │   └── rust/
 │       ├── profile.toml    # Rust profile (tools, phases, probes)
@@ -435,10 +451,12 @@ factory2/
 ├── prompts/                # Generic default prompt templates
 │   ├── understand.md
 │   ├── plan.md
+│   ├── plan_delta.md
 │   ├── implement.md
 │   ├── review.md
 │   ├── write_tests.md
 │   ├── verify.md
+│   ├── triage.md
 │   ├── summarize.md
 │   └── analyze_deps.md
 ├── pyproject.toml          # Python project config (no external deps)
@@ -515,21 +533,21 @@ The factory is designed to handle large spec sets (100+ stories) efficiently.
 ### What scales well
 
 - **Dependency analysis** is deterministic parsing, not an LLM call. It runs in milliseconds regardless of how many specs you have — no context window limits, no token cost.
-- **Incremental runs** skip stories whose spec hasn't changed. Editing one spec only re-runs that story and its downstream dependents.
+- **Incremental runs** skip stories whose spec hasn't changed. When a spec does change, holistic triage decides whether each affected story needs a full pipeline, a lighter incremental pipeline, or can be skipped entirely.
 - **Parallel pipelines** (`-j N`) process independent stories concurrently, bounded by the dependency graph.
 - **Per-story prompts** include only the current spec and its prior phase output — adding more stories to the project doesn't increase prompt size for unrelated stories.
 
 ### What to watch
 
 - **Codebase context snapshot.** Each phase prompt includes an auto-generated snapshot of the project's module tree, public API signatures, and dependencies (from `factory/context.py`). This grows with the total codebase size across all stories. At 100+ stories with many crates, this can become a significant portion of the context window. Consider splitting very large projects into separate workspaces.
-- **Dependency graph depth.** If you change a foundational story (e.g., the one that defines core types), every downstream story is invalidated. The factory uses a triage step (Haiku) to check whether the spec diff is actually relevant to each dependent before reprocessing — irrelevant changes are skipped automatically. Still, keep the graph shallow where possible.
+- **Dependency graph depth.** If you change a foundational story (e.g., the one that defines core types), every downstream story becomes a triage candidate. The holistic triage reads all diffs at once and decides which dependents actually need reprocessing (full, incremental, or skip). Still, keep the graph shallow where possible — fewer candidates means faster triage and fewer token-burning reruns.
 - **Parallel conflicts.** With `-j N > 1`, two stories modifying the same file can conflict. Sequential mode is safer for tightly coupled stories.
 
 ### Tips for large projects
 
 - **Keep specs focused.** One concern per spec. Smaller specs = smaller transitive dependency closures = faster incremental rebuilds.
-- **Declare dependencies accurately.** The factory trusts your `## Depends on` sections. Missing a dependency may cause build failures; adding unnecessary ones slows incremental runs by over-invalidating.
-- **Use `--rerun` sparingly.** Re-running a story cascades to all dependents. Target specific stories rather than forcing a full rebuild.
+- **Declare dependencies accurately.** The factory trusts your `## Depends on` sections for first-run ordering. Missing a dependency may cause build failures. On subsequent runs, the holistic triage decides what to reprocess — unnecessary dependencies just add triage candidates, but the triage itself filters out irrelevant changes.
+- **Use `--rerun` sparingly.** Re-running a story triggers the full pipeline. Target specific stories rather than forcing a full rebuild.
 - **Scope tests per story.** Each spec's verification section should run only its own tests (e.g., `make integration-test SPEC=NNN`), not the full suite. This prevents false failures from later stories when the factory reprocesses an earlier one.
 
 ## Limitations
