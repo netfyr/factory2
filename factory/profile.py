@@ -173,7 +173,7 @@ class Profile:
 
     def phase_list(self) -> list[str]:
         """Return ordered list of pipeline phases (excluding commit)."""
-        canonical = ["understand", "plan", "implement", "review", "write_tests", "verify"]
+        canonical = ["understand", "plan", "plan_delta", "implement", "review", "write_tests", "verify"]
         return [p for p in canonical if p in self.phases]
 
     def run_tool(self, tool_name: str, project_dir: Path) -> ToolResult:

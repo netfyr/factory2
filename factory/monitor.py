@@ -387,12 +387,16 @@ _TRIGGER_LABELS = {
     "cascade": "dependency changed",
     "quarantine_retry": "retry after quarantine",
     "interrupted_retry": "retry after interruption",
+    "escalation": "escalated from incremental",
+    "triage_full": "triage → full",
+    "triage_incremental": "triage → incremental",
 }
 
 _OUTCOME_COLORS = {
     "done": GREEN,
     "quarantined": RED,
     "interrupted": YELLOW,
+    "escalated": YELLOW,
 }
 
 
@@ -434,7 +438,9 @@ def show_history(state_dir: Path, story_filter: str = ""):
             outcome = run.get("outcome", "unknown")
             outcome_color = _OUTCOME_COLORS.get(outcome, "")
 
-            print(f"{BOLD}Run {num}{NC} — {trigger}", end="")
+            pipeline_mode = run.get("pipeline_mode", "full")
+            mode_tag = f"  [{pipeline_mode}]" if pipeline_mode != "full" else ""
+            print(f"{BOLD}Run {num}{NC} — {trigger}{mode_tag}", end="")
             print(f"  {outcome_color}{outcome.upper()}{NC}")
 
             started = run.get("started_at", "")

@@ -124,7 +124,8 @@ class State:
 
     # ── Run history ──────────────────────────────────────────────
 
-    def begin_run(self, story_id: str, trigger: str, spec_hash_val: str):
+    def begin_run(self, story_id: str, trigger: str, spec_hash_val: str,
+                  pipeline_mode: str = "full"):
         """Open a new run entry. Closes any orphaned previous run first."""
         ts = datetime.now().isoformat()
 
@@ -139,6 +140,7 @@ class State:
                 "started_at": ts,
                 "trigger": trigger,
                 "spec_hash": spec_hash_val,
+                "pipeline_mode": pipeline_mode,
             })
         self._update(update)
 

@@ -1,37 +1,19 @@
-"""Triage cascade-invalidated stories by checking spec diff relevance."""
+"""Holistic triage: decide per-story whether to run FULL, INCREMENTAL, or SKIP."""
 
 import difflib
+import json
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import log
 from .config import Config
 
 
-_TRIAGE_PROMPT = """\
-A specification file has been modified. You must determine whether a dependent \
-story needs reprocessing.
-
-## Changed specification: {changed_dep_id}
-
-### Diff (unified format):
-```
-{spec_diff}
-```
-
-## Dependent story specification: {story_id}
-
-{story_spec_content}
-
-## Question
-
-Does the change shown in the diff affect the implementation, tests, or \
-verification of story {story_id}? Consider whether the change modifies any \
-types, APIs, behaviors, test infrastructure, or conventions that story \
-{story_id} depends on.
-
-Answer YES or NO on the first line, followed by a one-sentence reason.\
-"""
+@dataclass
+class TriageDecision:
+    action: str   # "full", "incremental", or "skip"
+    reason: str
 
 
 def compute_spec_diff(spec_id: str, config: Config) -> str | None:
@@ -59,32 +41,34 @@ def compute_spec_diff(spec_id: str, config: Config) -> str | None:
     return "".join(diff) if diff else ""
 
 
-def should_reprocess(
-    story_id: str,
-    changed_dep_id: str,
-    spec_diff: str,
+def run_holistic_triage(
+    candidates: dict[str, dict],
     config: Config,
-) -> tuple[bool, str]:
-    """Ask Haiku whether a spec diff requires reprocessing a dependent story.
+) -> dict[str, TriageDecision]:
+    """Run a single LLM call to triage all candidate stories.
 
-    Returns (should_reprocess, reason).
-    Defaults to True on any failure (conservative).
-    Logs the full model response to stories/{story_id}/log/triage.log.
+    candidates maps story_id -> {
+        "own_diff": str | None,     # diff of the story's own spec, or None
+        "dep_diffs": dict[str, str] # dep_id -> diff for changed dependencies
+    }
+
+    Returns a dict of story_id -> TriageDecision.
+    Defaults to FULL on any failure (conservative).
     """
-    story_spec = config.specs_dir / f"{story_id}.md"
-    if not story_spec.exists():
-        return True, "story spec not found"
+    if not candidates:
+        return {}
 
-    story_spec_content = story_spec.read_text()
+    template = (config.factory_dir / "prompts" / "triage.md").read_text()
 
-    prompt = _TRIAGE_PROMPT.format(
-        changed_dep_id=changed_dep_id,
-        spec_diff=spec_diff,
-        story_id=story_id,
-        story_spec_content=story_spec_content,
+    spec_diffs_section = _build_diffs_section(candidates, config)
+    candidate_stories_section = _build_candidates_section(candidates, config)
+
+    prompt = template.format(
+        spec_diffs_section=spec_diffs_section,
+        candidate_stories_section=candidate_stories_section,
     )
 
-    log_dir = config.stories_dir / story_id / "log"
+    log_dir = config.output_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "triage.log"
 
@@ -103,33 +87,120 @@ def should_reprocess(
             capture_output=True,
             text=True,
             cwd=config.project_dir,
-            timeout=60,
+            timeout=120,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        log.warn(f"  Triage call failed for {story_id}: {e}")
-        return True, f"triage call failed: {e}"
+        log.warn(f"Triage call failed: {e}")
+        _log_triage(log_file, prompt, f"FAILED: {e}", "")
+        return _default_full(candidates)
 
-    # Write full response to log file (append for multiple deps)
-    with open(log_file, "a") as f:
-        f.write(f"=== Triage: {story_id} vs {changed_dep_id} ===\n")
-        f.write(f"--- prompt ---\n{prompt}\n")
-        f.write(f"--- response (exit {result.returncode}) ---\n")
-        f.write(result.stdout or "(empty)")
-        if result.stderr:
-            f.write(f"\n--- stderr ---\n{result.stderr}")
-        f.write("\n\n")
+    _log_triage(log_file, prompt, result.stdout, result.stderr)
 
     if result.returncode != 0:
-        log.warn(f"  Triage call failed for {story_id}: exit {result.returncode}")
-        return True, f"triage call failed: exit {result.returncode}"
+        log.warn(f"Triage call failed: exit {result.returncode}")
+        return _default_full(candidates)
 
-    output = result.stdout.strip()
-    if not output:
-        return True, "empty triage response"
+    return _parse_triage_response(result.stdout, candidates)
 
-    first_line = output.split("\n")[0].strip().upper()
-    reason = output.split("\n")[1].strip() if "\n" in output else ""
 
-    if first_line.startswith("NO"):
-        return False, reason or "not relevant"
-    return True, reason or "relevant"
+def _build_diffs_section(candidates: dict[str, dict], config: Config) -> str:
+    seen_diffs = set()
+    parts = []
+
+    for story_id, info in candidates.items():
+        if info.get("own_diff"):
+            key = f"own:{story_id}"
+            if key not in seen_diffs:
+                seen_diffs.add(key)
+                parts.append(
+                    f"### {story_id} (own spec changed)\n\n"
+                    f"```\n{info['own_diff']}\n```\n"
+                )
+
+        for dep_id, dep_diff in info.get("dep_diffs", {}).items():
+            key = f"dep:{dep_id}"
+            if key not in seen_diffs:
+                seen_diffs.add(key)
+                parts.append(
+                    f"### {dep_id} (dependency spec changed)\n\n"
+                    f"```\n{dep_diff}\n```\n"
+                )
+
+    return "\n".join(parts) if parts else "(no diffs available)\n"
+
+
+def _build_candidates_section(candidates: dict[str, dict], config: Config) -> str:
+    parts = []
+    for story_id, info in candidates.items():
+        spec_file = config.specs_dir / f"{story_id}.md"
+        if not spec_file.exists():
+            continue
+
+        triggers = []
+        if info.get("own_diff"):
+            triggers.append("own spec changed")
+        dep_names = list(info.get("dep_diffs", {}).keys())
+        if dep_names:
+            triggers.append(f"depends on changed: {', '.join(dep_names)}")
+
+        parts.append(
+            f"### {story_id}\n\n"
+            f"**Reason for candidacy:** {'; '.join(triggers)}\n\n"
+            f"{spec_file.read_text()}\n"
+        )
+
+    return "\n".join(parts)
+
+
+def _parse_triage_response(
+    output: str, candidates: dict[str, dict],
+) -> dict[str, TriageDecision]:
+    text = output.strip()
+
+    # Strip markdown fences if the model wrapped the JSON
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines)
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        log.warn("Triage: failed to parse JSON response, defaulting all to FULL")
+        return _default_full(candidates)
+
+    decisions = {}
+    for story_id in candidates:
+        entry = data.get(story_id)
+        if not entry or not isinstance(entry, dict):
+            log.warn(f"Triage: missing decision for {story_id}, defaulting to FULL")
+            decisions[story_id] = TriageDecision(action="full", reason="missing from triage response")
+            continue
+
+        action = entry.get("action", "FULL").upper()
+        reason = entry.get("reason", "")
+
+        if action not in ("FULL", "INCREMENTAL", "SKIP"):
+            log.warn(f"Triage: invalid action '{action}' for {story_id}, defaulting to FULL")
+            action = "FULL"
+
+        decisions[story_id] = TriageDecision(action=action.lower(), reason=reason)
+
+    return decisions
+
+
+def _default_full(candidates: dict[str, dict]) -> dict[str, TriageDecision]:
+    return {
+        sid: TriageDecision(action="full", reason="triage fallback")
+        for sid in candidates
+    }
+
+
+def _log_triage(log_file: Path, prompt: str, stdout: str, stderr: str):
+    with open(log_file, "a") as f:
+        f.write("=== Holistic Triage ===\n")
+        f.write(f"--- prompt ---\n{prompt}\n")
+        f.write(f"--- response ---\n{stdout or '(empty)'}\n")
+        if stderr:
+            f.write(f"--- stderr ---\n{stderr}\n")
+        f.write("\n\n")

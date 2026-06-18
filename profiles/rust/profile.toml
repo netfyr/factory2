@@ -60,6 +60,9 @@ model_tier = "default"
 [phases.plan]
 model_tier = "strong"
 
+[phases.plan_delta]
+model_tier = "strong"
+
 [phases.implement]
 model_tier = "default"
 post_checks = ["check"]

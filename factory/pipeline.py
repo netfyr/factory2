@@ -7,6 +7,7 @@ from .config import Config
 from .profile import Profile
 from .runner import run_agent
 from .state import State
+from .triage import compute_spec_diff
 
 
 def _format_model_display(model: str) -> str:
@@ -59,6 +60,40 @@ def run_story_pipeline(
         log.warn(f"[{story_id}] Commit failed (non-fatal)")
 
     log.info(f"[{story_id}] Pipeline complete")
+    return True
+
+
+def run_story_pipeline_incremental(
+    config: Config, story_id: str, spec_file: Path, state: State, profile: Profile,
+) -> bool:
+    """Run incremental pipeline for a story with minor changes. Returns True on success."""
+    story_dir = config.stories_dir / story_id
+    log_dir = story_dir / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log.phase(f"[{story_id}] Starting incremental pipeline")
+
+    if not _run_plan_delta(config, story_id, spec_file, story_dir, log_dir, state, profile):
+        log.error(f"[{story_id}] Phase 'plan_delta' failed")
+        return False
+
+    delta_plan = story_dir / "plan_delta.md"
+    if delta_plan.exists() and delta_plan.read_text().startswith("ESCALATE:"):
+        log.info(f"[{story_id}] plan_delta requested escalation")
+        return False
+
+    if not _run_implement_incremental(config, story_id, spec_file, story_dir, log_dir, state, profile):
+        log.error(f"[{story_id}] Phase 'implement' failed (incremental)")
+        return False
+
+    if not _run_verify(config, story_id, spec_file, story_dir, log_dir, state, profile):
+        log.error(f"[{story_id}] Phase 'verify' failed (incremental)")
+        return False
+
+    if not _run_commit(config, story_id, spec_file, story_dir, log_dir, state, profile):
+        log.warn(f"[{story_id}] Commit failed (non-fatal)")
+
+    log.info(f"[{story_id}] Incremental pipeline complete")
     return True
 
 
@@ -206,6 +241,85 @@ def _run_plan(config, story_id, spec_file, story_dir, log_dir, state, profile):
         profile.get_model("plan", config),
         profile.get_max_turns("plan", config),
         output_file=output_file,
+    )
+
+
+def _run_plan_delta(config, story_id, spec_file, story_dir, log_dir, state, profile):
+    output_file = story_dir / "plan_delta.md"
+    if _phase_done(state, story_id, "plan_delta", output_file):
+        return True
+
+    template = profile.get_prompt_path("plan_delta").read_text()
+    context = profile.generate_context(config)
+
+    understand_file = story_dir / "understand.md"
+    plan_file = story_dir / "plan.md"
+    understand_content = understand_file.read_text() if understand_file.exists() else "(not available)"
+    plan_content = plan_file.read_text() if plan_file.exists() else "(not available)"
+
+    diff = compute_spec_diff(story_id, config)
+    diff_section = diff if diff else "(no own-spec diff — triggered by dependency change)"
+
+    prompt = (
+        f"{template}\n\n"
+        f"## Your Task\n\n"
+        f"- Story ID: {story_id}\n"
+        f"- Write your delta plan to: {output_file}\n"
+        f"- The project code is in: {config.project_dir}/\n\n"
+        f"{context}"
+        f"## Specification (current)\n\n{spec_file.read_text()}\n\n"
+        f"## Spec Changes (diff)\n\n```\n{diff_section}\n```\n\n"
+        f"## Previous Understanding\n\n{understand_content}\n\n"
+        f"## Previous Plan\n\n{plan_content}"
+    )
+
+    return _run_phase(
+        config, state, story_id, "plan_delta", prompt,
+        log_dir / "plan_delta.log",
+        profile.get_model("plan_delta", config),
+        profile.get_max_turns("plan_delta", config),
+        output_file=output_file,
+    )
+
+
+def _run_implement_incremental(config, story_id, spec_file, story_dir, log_dir, state, profile):
+    if _phase_done(state, story_id, "implement"):
+        return True
+
+    delta_plan_file = story_dir / "plan_delta.md"
+    template = profile.get_prompt_path("implement").read_text()
+    context = profile.generate_context(config)
+    prompt = (
+        f"{template}\n\n"
+        f"## Your Task\n\n"
+        f"- Story ID: {story_id}\n"
+        f"- The project code is in: {config.project_dir}/\n"
+        f"- Work inside the project directory. Modify files as needed.\n"
+        f"- This is an INCREMENTAL update — existing code already works. "
+        f"Apply only the changes described in the delta plan.\n"
+        f"- ALSO update or add tests as described in the delta plan's "
+        f"Test Updates section.\n\n"
+        f"{context}"
+        f"## Specification\n\n{spec_file.read_text()}\n\n"
+        f"## Delta Plan (changes to apply)\n\n{delta_plan_file.read_text()}"
+    )
+
+    def post_check():
+        for tool_name in profile.get_phase("implement").post_checks:
+            result = profile.run_tool(tool_name, config.project_dir)
+            if not result.success:
+                log.warn(f"[{story_id}] implement (incremental): {tool_name} failed — {result.summary}")
+                if result.details:
+                    log.warn(result.details)
+                return False
+        return True
+
+    return _run_phase(
+        config, state, story_id, "implement", prompt,
+        log_dir / "implement.log",
+        profile.get_model("implement", config),
+        profile.get_max_turns("implement", config),
+        post_check=post_check,
     )
 
 

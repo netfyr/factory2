@@ -12,11 +12,11 @@ from .deps import (
     run_llm_dependency_analysis,
     topo_sort,
 )
-from .pipeline import run_story_pipeline
+from .pipeline import run_story_pipeline, run_story_pipeline_incremental
 from .profile import Profile
 from .runner import run_agent
 from .state import State, spec_hash, specs_combined_hash
-from .triage import compute_spec_diff, should_reprocess
+from .triage import compute_spec_diff, run_holistic_triage
 
 
 def run_factory(config: Config, profile: Profile):
@@ -159,15 +159,6 @@ def _discover_stories(config: Config) -> list[str]:
 # ── Sequential processing ────────────────────────────────────────
 
 
-def _story_needs_processing(story_id: str, config: Config, state: State) -> bool:
-    status = state.get_story_status(story_id)
-    if status in ("pending", "quarantined", "skipped", "in_progress"):
-        return True
-    old_hash = state.get_spec_hash(story_id)
-    new_hash = spec_hash(config.specs_dir / f"{story_id}.md")
-    return old_hash != new_hash
-
-
 def _detect_trigger(story_id: str, config: Config, state: State) -> str:
     """Determine why a story needs processing."""
     if story_id in config.rerun:
@@ -185,23 +176,106 @@ def _detect_trigger(story_id: str, config: Config, state: State) -> str:
 
 
 def _compute_needs_processing(config, state, order):
-    """Pre-compute which stories need reprocessing and their triggers."""
+    """Pre-compute which stories need reprocessing, their triggers, and pipeline modes.
+
+    Returns (needs_processing, triggers, pipeline_modes) where pipeline_modes
+    maps story_id -> "full" or "incremental".
+    """
     needs_processing = set()
     triggers = {}
-    diff_cache = {}
+    pipeline_modes = {}
+    triage_candidates = {}
+
+    # Pass 1: identify stories that always need full processing
     for sid in order:
-        if _story_needs_processing(sid, config, state):
+        status = state.get_story_status(sid)
+
+        if sid in config.rerun:
+            needs_processing.add(sid)
+            triggers[sid] = "rerun"
+            pipeline_modes[sid] = "full"
+            continue
+
+        if status in ("pending", "in_progress"):
             needs_processing.add(sid)
             triggers[sid] = _detect_trigger(sid, config, state)
-        elif any(dep in needs_processing for dep in get_dependencies(sid, config.deps_file)):
-            changed_deps = [d for d in get_dependencies(sid, config.deps_file) if d in needs_processing]
-            if _should_cascade(sid, changed_deps, config, diff_cache):
+            pipeline_modes[sid] = "full"
+            continue
+
+        if status in ("quarantined", "skipped"):
+            needs_processing.add(sid)
+            triggers[sid] = _detect_trigger(sid, config, state)
+            pipeline_modes[sid] = "full"
+            continue
+
+    # Pass 2: identify triage candidates (completed stories with changes)
+    diff_cache = {}
+    for sid in order:
+        if sid in needs_processing:
+            continue
+
+        old_hash = state.get_spec_hash(sid)
+        new_hash = spec_hash(config.specs_dir / f"{sid}.md")
+        own_changed = old_hash != new_hash
+
+        changed_deps = [
+            d for d in get_dependencies(sid, config.deps_file)
+            if d in needs_processing
+        ]
+
+        if not own_changed and not changed_deps:
+            continue
+
+        # Build diff info for triage
+        own_diff = None
+        if own_changed:
+            own_diff = compute_spec_diff(sid, config)
+            if own_diff is None:
+                # No snapshot (first run for this story) — must do full
+                needs_processing.add(sid)
+                triggers[sid] = "spec_changed"
+                pipeline_modes[sid] = "full"
+                continue
+
+        dep_diffs = {}
+        for dep in changed_deps:
+            if dep not in diff_cache:
+                diff_cache[dep] = compute_spec_diff(dep, config)
+            diff = diff_cache[dep]
+            if diff is None:
+                # No snapshot for dependency — must do full
                 needs_processing.add(sid)
                 triggers[sid] = "cascade"
-                log.info(f"Invalidating {sid}: dependency change is relevant")
+                pipeline_modes[sid] = "full"
+                break
+            if diff:
+                dep_diffs[dep] = diff
+
+        if sid in needs_processing:
+            continue
+
+        if own_diff or dep_diffs:
+            triage_candidates[sid] = {
+                "own_diff": own_diff,
+                "dep_diffs": dep_diffs,
+                "own_changed": own_changed,
+            }
+
+    # Pass 3: holistic triage for all candidates
+    if triage_candidates:
+        log.phase(f"Running holistic triage for {len(triage_candidates)} candidate(s)...")
+        decisions = run_holistic_triage(triage_candidates, config)
+        for sid, decision in decisions.items():
+            if decision.action == "skip":
+                log.info(f"Triage: skip {sid} — {decision.reason}")
             else:
-                log.info(f"Skipping {sid}: dependency change is irrelevant (triage)")
-    return needs_processing, triggers
+                needs_processing.add(sid)
+                info = triage_candidates[sid]
+                triggers[sid] = "spec_changed" if info["own_changed"] else "cascade"
+                pipeline_modes[sid] = decision.action
+                log.info(f"Triage: {decision.action} for {sid} — {decision.reason}")
+
+    return needs_processing, triggers, pipeline_modes
 
 
 def _process_sequential(config: Config, state: State, profile: Profile):
@@ -209,7 +283,7 @@ def _process_sequential(config: Config, state: State, profile: Profile):
     total = len(order)
     done_count = skip_count = quar_count = uptodate_count = 0
 
-    needs_processing, triggers = _compute_needs_processing(config, state, order)
+    needs_processing, triggers, pipeline_modes = _compute_needs_processing(config, state, order)
 
     for i, story_id in enumerate(order, 1):
         log.info(f"{'━' * 3} Story: {story_id} ({i}/{total}) {'━' * 3}")
@@ -222,24 +296,23 @@ def _process_sequential(config: Config, state: State, profile: Profile):
             skip_count += 1
             continue
 
-        # Incremental: skip if up-to-date
+        # Skip if up-to-date
         if story_id not in needs_processing:
             log.info(f"Skipping {story_id}: already up to date")
             uptodate_count += 1
             continue
 
-        # Process
         spec_file = config.specs_dir / f"{story_id}.md"
         new_hash = spec_hash(spec_file)
-        if new_hash != state.get_spec_hash(story_id):
-            state.clear_phases(story_id)
         state.set_spec_hash(story_id, new_hash)
         state.set_story_status(story_id, "in_progress")
 
         trigger = triggers.get(story_id, "initial")
-        state.begin_run(story_id, trigger, new_hash)
+        mode = pipeline_modes.get(story_id, "full")
+        success = _run_story(config, story_id, spec_file, state, profile,
+                             trigger, new_hash, mode)
 
-        if run_story_pipeline(config, story_id, spec_file, state, profile):
+        if success:
             state.set_story_status(story_id, "done")
             state.end_run(story_id, "done")
             _snapshot_story_spec(config, story_id)
@@ -260,26 +333,29 @@ def _process_sequential(config: Config, state: State, profile: Profile):
     )
 
 
-def _should_cascade(story_id: str, changed_deps: list[str], config: Config, diff_cache: dict) -> bool:
-    """Check whether any changed dependency's diff is relevant to this story."""
-    for dep in changed_deps:
-        if dep not in diff_cache:
-            diff_cache[dep] = compute_spec_diff(dep, config)
+def _run_story(config, story_id, spec_file, state, profile, trigger, new_hash, mode):
+    """Run the appropriate pipeline for a story, with auto-escalation."""
+    if mode == "incremental":
+        for phase in ["plan_delta", "implement", "verify", "commit"]:
+            state.set_phase_status(story_id, phase, "pending")
+        state.begin_run(story_id, trigger, new_hash, pipeline_mode="incremental")
 
-        diff = diff_cache[dep]
-        if diff is None:
-            # No stored copy — first run or new spec, must reprocess
-            return True
-        if diff == "":
-            # Spec unchanged (cascade-only invalidation), check transitive
-            continue
+        success = run_story_pipeline_incremental(
+            config, story_id, spec_file, state, profile)
 
-        reprocess, reason = should_reprocess(story_id, dep, diff, config)
-        log.info(f"  Triage {story_id} vs {dep}: {'YES' if reprocess else 'NO'} — {reason}")
-        if reprocess:
-            return True
+        if not success:
+            log.warn(f"[{story_id}] Incremental pipeline failed, escalating to full")
+            state.end_run(story_id, "escalated")
+            state.clear_phases(story_id)
+            state.begin_run(story_id, "escalation", new_hash, pipeline_mode="full")
+            success = run_story_pipeline(
+                config, story_id, spec_file, state, profile)
+    else:
+        state.clear_phases(story_id)
+        state.begin_run(story_id, trigger, new_hash, pipeline_mode="full")
+        success = run_story_pipeline(config, story_id, spec_file, state, profile)
 
-    return False
+    return success
 
 
 def _archive_run_logs(config: Config, state: State, story_id: str):
@@ -319,7 +395,7 @@ def _find_failed_dependency(story_id: str, deps_file: Path, state: State) -> str
 def _process_parallel(config: Config, state: State, profile: Profile):
     order = topo_sort(config.deps_file)
 
-    needs_processing, triggers = _compute_needs_processing(config, state, order)
+    needs_processing, triggers, pipeline_modes = _compute_needs_processing(config, state, order)
 
     status_map = {}
     for sid in order:
@@ -329,6 +405,11 @@ def _process_parallel(config: Config, state: State, profile: Profile):
             status_map[sid] = "done"
 
     futures = {}  # future -> story_id
+
+    def _run_parallel_story(sid, spec_file, trigger, new_hash, mode):
+        state.set_story_status(sid, "in_progress")
+        return _run_story(config, sid, spec_file, state, profile,
+                          trigger, new_hash, mode)
 
     with ThreadPoolExecutor(max_workers=config.max_parallel) as executor:
         while True:
@@ -343,18 +424,15 @@ def _process_parallel(config: Config, state: State, profile: Profile):
                 if all(status_map.get(d) == "done" for d in deps):
                     spec_file = config.specs_dir / f"{sid}.md"
                     new_hash = spec_hash(spec_file)
-                    if new_hash != state.get_spec_hash(sid):
-                        state.clear_phases(sid)
                     state.set_spec_hash(sid, new_hash)
-                    state.set_story_status(sid, "in_progress")
 
                     trigger = triggers.get(sid, "initial")
-                    state.begin_run(sid, trigger, new_hash)
+                    mode = pipeline_modes.get(sid, "full")
 
                     status_map[sid] = "running"
-                    log.info(f"Launching parallel pipeline for {sid}")
+                    log.info(f"Launching parallel {mode} pipeline for {sid}")
                     future = executor.submit(
-                        run_story_pipeline, config, sid, spec_file, state, profile
+                        _run_parallel_story, sid, spec_file, trigger, new_hash, mode
                     )
                     futures[future] = sid
 
