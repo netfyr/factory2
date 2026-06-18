@@ -174,6 +174,7 @@ def _run_phase(
                 cache_read_tokens=usage.cache_read_tokens,
                 num_turns=usage.num_turns,
                 model=model,
+                cost_usd=usage.cost_usd,
             )
 
         if stalled and stall_attempt < _MAX_STALL_RETRIES:
@@ -711,6 +712,7 @@ def _run_commit(config, story_id, spec_file, story_dir, log_dir, state, profile)
             cache_read_tokens=usage.cache_read_tokens,
             num_turns=usage.num_turns,
             model=commit_model,
+            cost_usd=usage.cost_usd,
         )
 
     # Read generated commit message, or extract from agent text output

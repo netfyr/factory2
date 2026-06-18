@@ -191,6 +191,7 @@ class State:
         input_tokens: int, output_tokens: int,
         cache_creation_tokens: int = 0, cache_read_tokens: int = 0,
         num_turns: int = 0, model: str = "",
+        cost_usd: float = 0.0,
     ):
         def update(data):
             story = self._ensure_story(data, story_id)
@@ -198,13 +199,14 @@ class State:
             pc = costs.setdefault(phase, {
                 "input_tokens": 0, "output_tokens": 0,
                 "cache_creation_tokens": 0, "cache_read_tokens": 0,
-                "num_turns": 0,
+                "num_turns": 0, "cost_usd": 0.0,
             })
             pc["input_tokens"] += input_tokens
             pc["output_tokens"] += output_tokens
             pc["cache_creation_tokens"] = pc.get("cache_creation_tokens", 0) + cache_creation_tokens
             pc["cache_read_tokens"] = pc.get("cache_read_tokens", 0) + cache_read_tokens
             pc["num_turns"] = pc.get("num_turns", 0) + num_turns
+            pc["cost_usd"] = pc.get("cost_usd", 0.0) + cost_usd
             if model:
                 pc["model"] = model
         self._update(update)

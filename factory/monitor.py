@@ -103,7 +103,15 @@ def _model_tier(model: str) -> str:
     return "sonnet"  # default fallback
 
 
-def _estimate_cost(cost_entry: dict) -> float:
+def _phase_cost(cost_entry: dict) -> float:
+    """Return the cost for a phase: actual if available, otherwise estimated."""
+    actual = cost_entry.get("cost_usd", 0.0)
+    if actual:
+        return actual
+    return _estimate_cost_from_tokens(cost_entry)
+
+
+def _estimate_cost_from_tokens(cost_entry: dict) -> float:
     tier = _model_tier(cost_entry.get("model", ""))
     inp_rate, cache_w_rate, cache_r_rate, out_rate = _MODEL_RATES[tier]
     inp = cost_entry.get("input_tokens", 0)
@@ -116,6 +124,11 @@ def _estimate_cost(cost_entry: dict) -> float:
         + cache_r / 1_000_000 * cache_r_rate
         + out / 1_000_000 * out_rate
     )
+
+
+def _has_actual_cost(costs: dict) -> bool:
+    """Check if any phase in the costs dict has an actual API-reported cost."""
+    return any(c.get("cost_usd", 0.0) > 0 for c in costs.values())
 
 
 # ── Status display ───────────────────────────────────────────────
@@ -327,7 +340,7 @@ def show_status(state_dir: Path):
             grand_cache_r += c.get("cache_read_tokens", 0)
             grand_out += c.get("output_tokens", 0)
             grand_turns += c.get("num_turns", 0)
-            total_est += _estimate_cost(c)
+            total_est += _phase_cost(c)
         # Add live usage from currently running phase
         live = _read_live_usage(stories_dir / sid / "live_usage")
         if live:
@@ -339,7 +352,12 @@ def show_status(state_dir: Path):
 
     grand_all_in = grand_in + grand_cache_w + grand_cache_r
     if grand_all_in or grand_out:
-        cost_or_turns = f"{DIM}(~${total_est:.2f}){NC}" if total_est else ""
+        cost_prefix = "$" if any(
+            c.get("cost_usd", 0) > 0
+            for s in all_costs.values()
+            for c in s.get("costs", {}).values()
+        ) else "~$"
+        cost_or_turns = f"{DIM}({cost_prefix}{total_est:.2f}){NC}" if total_est else ""
         if grand_turns:
             cost_or_turns = f"{BOLD}{grand_turns}{NC} requests  " + cost_or_turns
         print(
@@ -469,9 +487,10 @@ def show_history(state_dir: Path, story_filter: str = ""):
                     for c in costs.values()
                 )
                 run_out = sum(c.get("output_tokens", 0) for c in costs.values())
-                run_est = sum(_estimate_cost(c) for c in costs.values())
+                run_est = sum(_phase_cost(c) for c in costs.values())
                 total_cost += run_est
-                print(f"  Tokens:   {format_tokens(run_in)} in / {format_tokens(run_out)} out (~${run_est:.2f})")
+                cost_prefix = "$" if _has_actual_cost(costs) else "~$"
+                print(f"  Tokens:   {format_tokens(run_in)} in / {format_tokens(run_out)} out ({cost_prefix}{run_est:.2f})")
 
             spec_hash = run.get("spec_hash", "")
             if spec_hash:
@@ -531,13 +550,18 @@ def show_history(state_dir: Path, story_filter: str = ""):
 
             total_cost = 0.0
             last_run_cost = 0.0
+            has_actual = False
             for run in runs:
-                run_cost = sum(_estimate_cost(c) for c in run.get("costs", {}).values())
+                costs = run.get("costs", {})
+                run_cost = sum(_phase_cost(c) for c in costs.values())
                 total_cost += run_cost
                 last_run_cost = run_cost
+                if _has_actual_cost(costs):
+                    has_actual = True
 
-            last_cost_str = f"~${last_run_cost:.2f}" if last_run_cost else ""
-            total_cost_str = f"~${total_cost:.2f}" if total_cost and len(runs) > 1 else ""
+            cost_prefix = "$" if has_actual else "~$"
+            last_cost_str = f"{cost_prefix}{last_run_cost:.2f}" if last_run_cost else ""
+            total_cost_str = f"{cost_prefix}{total_cost:.2f}" if total_cost and len(runs) > 1 else ""
 
             status_vis = _visible_len(status)
             status_pad = 15 - status_vis

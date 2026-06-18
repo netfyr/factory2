@@ -15,6 +15,7 @@ class Usage:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     num_turns: int = 0
+    cost_usd: float = 0.0
 
 
 def run_agent(
@@ -79,7 +80,7 @@ def run_agent(
             if stripped:
                 old_in, old_out = usage.input_tokens, usage.output_tokens
                 _accumulate_usage(stripped, usage)
-                _accumulate_turns(stripped, usage)
+                _accumulate_result(stripped, usage)
                 if activity_file:
                     _update_activity(stripped, activity_file)
                     if usage.input_tokens != old_in or usage.output_tokens != old_out:
@@ -258,14 +259,18 @@ def _write_live_usage(path: Path, usage: Usage):
     tmp.rename(path)
 
 
-def _accumulate_turns(line: str, usage: Usage):
-    """Extract num_turns from a stream-json result line."""
+def _accumulate_result(line: str, usage: Usage):
+    """Extract num_turns and actual cost from a stream-json result line."""
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
         return
-    if isinstance(obj, dict) and obj.get("type") == "result":
-        usage.num_turns = max(usage.num_turns, obj.get("num_turns", 0))
+    if not isinstance(obj, dict) or obj.get("type") != "result":
+        return
+    usage.num_turns = max(usage.num_turns, obj.get("num_turns", 0))
+    cost = obj.get("total_cost_usd")
+    if cost is not None:
+        usage.cost_usd = cost
 
 
 def _accumulate_usage(line: str, usage: Usage):
