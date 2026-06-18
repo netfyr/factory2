@@ -88,9 +88,9 @@ def format_tokens(n: int) -> str:
 
 # Per-million-token pricing (input, cache_write, cache_read, output)
 _MODEL_RATES = {
-    "opus": (15, 18.75, 1.50, 75),
+    "opus": (5, 6.25, 0.50, 25),
     "sonnet": (3, 3.75, 0.30, 15),
-    "haiku": (0.80, 1.00, 0.08, 4),
+    "haiku": (1.00, 1.25, 0.10, 5),
 }
 
 
@@ -496,9 +496,9 @@ def show_history(state_dir: Path, story_filter: str = ""):
         print(f"{DIM}{'━' * 70}{NC}\n")
 
         name_width = min(max((len(sid) for sid in sorted_sids), default=20) + 2, 40)
-        header = f"  {BOLD}{'STORY':<{name_width}}{'RUNS':>6}  {'CURRENT':<15}{'LAST RUN':<20}{'COST':>10}{NC}"
+        header = f"  {BOLD}{'STORY':<{name_width}}{'RUNS':>6}  {'CURRENT':<15}{'LAST RUN':<20}{'LAST COST':>10}{'TOTAL COST':>12}{NC}"
         print(header)
-        print(f"  {DIM}{'─' * (name_width + 53)}{NC}")
+        print(f"  {DIM}{'─' * (name_width + 65)}{NC}")
 
         for sid in sorted_sids:
             story = stories[sid]
@@ -524,11 +524,14 @@ def show_history(state_dir: Path, story_filter: str = ""):
                     pass
 
             total_cost = 0.0
+            last_run_cost = 0.0
             for run in runs:
-                for c in run.get("costs", {}).values():
-                    total_cost += _estimate_cost(c)
+                run_cost = sum(_estimate_cost(c) for c in run.get("costs", {}).values())
+                total_cost += run_cost
+                last_run_cost = run_cost
 
-            cost_str = f"~${total_cost:.2f}" if total_cost else ""
+            last_cost_str = f"~${last_run_cost:.2f}" if last_run_cost else ""
+            total_cost_str = f"~${total_cost:.2f}" if total_cost and len(runs) > 1 else ""
 
             status_vis = _visible_len(status)
             status_pad = 15 - status_vis
@@ -537,7 +540,8 @@ def show_history(state_dir: Path, story_filter: str = ""):
                 f"{len(runs):>6}  "
                 f"{colored_status(status)}{' ' * max(status_pad, 1)}"
                 f"{last_time:<20}"
-                f"{cost_str:>10}"
+                f"{last_cost_str:>10}"
+                f"{total_cost_str:>12}"
             )
             print(line)
 
